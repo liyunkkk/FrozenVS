@@ -21,16 +21,12 @@ jobs:
             -IFrozenVS/include FrozenVS/test/test_rekernel.cpp -o /tmp/t_rekernel
           /tmp/t_rekernel
 
-      - name: Setup Android NDK
-        id: ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r27c
-          local-cache: true
-
       - name: Build & pack
         env:
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          # ubuntu-latest 镜像自带 NDK (r27+, 满足 -std=c++23)。
+          # 不用 setup-ndk: 其 local-cache 会把缓存解到 workspace 而 ndk-path
+          # 仍指向空的 ~/.setup-ndk/<ver>, 导致第二次以后的构建找不到 clang++。
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
         run: |
           chmod +x FrozenVS/build_pack.sh
           FrozenVS/build_pack.sh

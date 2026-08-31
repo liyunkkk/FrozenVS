@@ -15,15 +15,28 @@ cd "$SCRIPT_DIR"
 
 NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}}"
 [ -n "$NDK" ] || abort "未找到 NDK, 请设置 ANDROID_NDK_HOME"
+[ -d "$NDK" ] || abort "NDK 目录不存在: $NDK"
 
 HOST_TAG="linux-x86_64"
 case "$(uname -s)" in
     Darwin) HOST_TAG="darwin-x86_64" ;;
 esac
 
+# setup-ndk 从缓存恢复时, ndk-path 可能多包一层目录, 因此固定路径拼装不可靠。
+# 先试标准布局, 再退化为在 NDK 目录下搜索 (深度有限, 避免全盘遍历)。
 CLANG="$NDK/toolchains/llvm/prebuilt/$HOST_TAG/bin/clang++"
-SYSROOT="$NDK/toolchains/llvm/prebuilt/$HOST_TAG/sysroot"
-[ -x "$CLANG" ] || abort "clang++ 不存在: $CLANG"
+if [ ! -x "$CLANG" ]; then
+    CLANG="$(find "$NDK" -maxdepth 7 -type f -path '*/toolchains/llvm/prebuilt/*/bin/clang++' \
+        -print -quit 2>/dev/null || true)"
+fi
+[ -n "$CLANG" ] && [ -x "$CLANG" ] || abort "clang++ 不存在于 NDK: $NDK"
+
+# sysroot 与 clang++ 同属一个 prebuilt 目录
+SYSROOT="$(dirname "$(dirname "$CLANG")")/sysroot"
+[ -d "$SYSROOT" ] || abort "sysroot 不存在: $SYSROOT"
+
+log "使用 NDK: $NDK"
+log "使用 clang++: $CLANG"
 
 TARGET="aarch64-none-linux-android29"
 CPPFLAGS=(
