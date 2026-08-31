@@ -1,0 +1,49 @@
+name: Build Frozen Module
+
+on:
+  push:
+    branches: [ master, 'fix/**' ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unit test (host, netlink parsers)
+        run: |
+          clang++ -std=c++23 -O1 -Wall -Wextra \
+            -IFrozenVS/include FrozenVS/test/test_rekernel.cpp -o /tmp/t_rekernel
+          /tmp/t_rekernel
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          local-cache: true
+
+      - name: Build & pack
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          chmod +x FrozenVS/build_pack.sh
+          FrozenVS/build_pack.sh
+
+      - name: Read module version
+        id: meta
+        run: |
+          echo "version=$(sed -n 's/^version=//p' FrozenVS/magisk/module.prop | head -1)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Frozen-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.sha }}
+          path: FrozenVS/Frozen-*.zip
+          if-no-files-found: error
