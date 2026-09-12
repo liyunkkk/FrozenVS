@@ -200,13 +200,6 @@ public:
         } break;
 
         case MANAGER_CMD::getAppCfg: {
-            // 管理器每次读取列表前都与 PackageManager 对齐。否则应用卸载后，
-            // 守护进程会一直返回启动时缓存的 UID/配置，直到重启或保存配置。
-            managedApp.updateAppList();
-            managedApp.saveConfig();
-            managedApp.saveLabel();
-            managedApp.update2xposedByLocalSocket();
-
             uint32_t intCnt = 0;
             const auto ptr = reinterpret_cast<int*>(replyBuf.get());
             for (const auto& appInfo : managedApp.appInfoMap) {
