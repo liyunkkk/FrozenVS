@@ -1,6 +1,6 @@
 id=Frozen
 name=Frozen
-version=9.0.3-rk11
-versionCode=20260419
+version=9.0.3-activity-beta1
+versionCode=2026091201
 author=MoWei
-description=第三方安卓墓碑，实现堪比"IOS"类似的完美墓碑机制 [个人分支: 适配 Re:Kernel v11.0 Generic Netlink + 修复宽松前台误冻结]
+description=第三方安卓墓碑 [测试分支: Re:Kernel v11 + DeepDoze 解耦 + 音频防抖 + UID流量豁免]

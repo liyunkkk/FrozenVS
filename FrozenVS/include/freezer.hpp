@@ -37,6 +37,28 @@ private:
     unordered_set<int> monitoredNetUid;            // 已向内核登记网络事件订阅的 uid
     mutex netMonitorMutex;
 
+    // 连续任务保护。音频主信号来自 FrozenApp 的播放器状态；声卡仅作为兜底。
+    // 网络保护采用“到期前短暂采样 UID 流量”的按需策略，避免常驻轮询打扰深睡。
+    static constexpr int AUDIO_GRACE_SECONDS = 15;
+    static constexpr int NETWORK_RECHECK_SECONDS = 10;
+    static constexpr int NETWORK_SAMPLE_MS = 1000;
+    static constexpr uint64_t NETWORK_ENTER_BYTES_PER_SEC = 32ULL * 1024ULL;
+    static constexpr uint64_t NETWORK_EXIT_BYTES_PER_SEC = 8ULL * 1024ULL;
+    unordered_map<int, time_t> audioGraceUntil;
+    enum class NetworkActivity {
+        UNAVAILABLE,
+        SAMPLING,
+        IDLE,
+        ACTIVE,
+    };
+    struct NetworkSample {
+        uint64_t totalBytes;
+        std::chrono::steady_clock::time_point sampledAt;
+    };
+    unordered_map<int, NetworkSample> networkSamples;
+    unordered_set<int> networkProtected;
+    mutex activityMutex;
+
 
     static constexpr size_t GET_VISIBLE_BUF_SIZE = 256 * 1024;
     unique_ptr<char[]> getVisibleAppBuff;
@@ -774,6 +796,7 @@ public:
             return;
 
         for (const int uid : newShowOnApp) {
+            clearActivityState(uid);
             // 如果在待冻结列表则只需移除
             if (pendingHandleList.erase(uid)) {
                 isupdate = true;
@@ -814,8 +837,8 @@ public:
 
             const int uid = it->first;
             auto& appInfo = managedApp[uid];
-            if (appInfo.isAudioPlaying) { // 不该被冻结
-                remainSec = 1;  // 保持在 1, 避免无界递减; 音频停止后下一秒即可冻结
+            if (appInfo.isAudioPlaying) { // 正在播放，不该被冻结
+                remainSec = 1;
                 it++;
                 continue;
             }
@@ -824,15 +847,38 @@ public:
                 isupdate = true;
                 continue;
             }
-
             if (curForegroundApp.contains(uid)) { // 前台应用(含宽松前台)不应该在待冻结列表中
                 it = pendingHandleList.erase(it);
                 isupdate = true;
                 continue;
             }
-
-
-
+            {
+                lock_guard<mutex> lock(activityMutex);
+                const auto grace = audioGraceUntil.find(uid);
+                if (grace != audioGraceUntil.end()) {
+                    const time_t now = time(nullptr);
+                    if (grace->second > now) {
+                        remainSec = std::max(1, static_cast<int>(grace->second - now));
+                        it++;
+                        continue;
+                    }
+                    audioGraceUntil.erase(grace);
+                }
+            }
+            if (appInfo.isPermissive) {
+                uint64_t speed = 0;
+                const NetworkActivity activity = sampleNetworkActivity(uid, speed);
+                if (activity == NetworkActivity::SAMPLING || activity == NetworkActivity::ACTIVE) {
+                    remainSec = activity == NetworkActivity::ACTIVE ? NETWORK_RECHECK_SECONDS : 1;
+                    if (activity == NetworkActivity::ACTIVE)
+                        freezeit.logFmt("暂缓冻结 %s: 网络活跃 %llu KiB/s",
+                            appInfo.label.c_str(),
+                            static_cast<unsigned long long>(speed / 1024ULL));
+                    it++;
+                    continue;
+                }
+            }
+            clearNetworkState(uid);
             int num = handleProcess(appInfo, true);
             if (num < 0) {
                 if (appInfo.delayCnt >= 5) {
@@ -1143,6 +1189,10 @@ public:
                 if (!appInfo.isPermissive) continue;  // 严格前台: 音频不算前台
 
                 appInfo.isAudioPlaying = true;
+                {
+                    lock_guard<mutex> lock(activityMutex);
+                    audioGraceUntil.erase(uid);
+                }
                 currentAudioApp.emplace_back(uid);
             }
 
@@ -1155,8 +1205,14 @@ public:
                     }
                 }
 
-                if (!stillPlaying && managedApp.contains(lastUid))
-                    managedApp[lastUid].isAudioPlaying = false;
+                if (!stillPlaying && managedApp.contains(lastUid)) {
+                    auto& appInfo = managedApp[lastUid];
+                    appInfo.isAudioPlaying = false;
+                    if (appInfo.isPermissive) {
+                        lock_guard<mutex> lock(activityMutex);
+                        audioGraceUntil[lastUid] = time(nullptr) + AUDIO_GRACE_SECONDS;
+                    }
+                }
             }
 
             lastAudioApp = std::move(currentAudioApp);
@@ -1165,6 +1221,88 @@ public:
         }
     }
 
+
+    static int openPinnedBpfMap(const char* path) {
+        union bpf_attr attr{};
+        attr.pathname = reinterpret_cast<uint64_t>(path);
+        return static_cast<int>(syscall(__NR_bpf, BPF_OBJ_GET, &attr, sizeof(attr)));
+    }
+
+    static bool readUidTraffic(int uid, uint64_t& totalBytes) {
+        // Android netd 的 app_uid_stats_map: key 为 uint32_t UID，value 为 StatsValue。
+        // pinned BPF 对象不能用 open(2) 当作 map fd，必须通过 BPF_OBJ_GET 获取。
+        constexpr const char* paths[] = {
+            "/sys/fs/bpf/netd_shared/map_netd_app_uid_stats_map",
+            "/sys/fs/bpf/map_netd_app_uid_stats_map", // Android 旧布局兜底
+        };
+        int fd = -1;
+        for (const char* path : paths) {
+            fd = openPinnedBpfMap(path);
+            if (fd >= 0) break;
+        }
+        if (fd < 0) return false;
+
+        struct AppUidStatsValue {
+            uint64_t rxPackets;
+            uint64_t rxBytes;
+            uint64_t txPackets;
+            uint64_t txBytes;
+        } value{};
+        union bpf_attr attr{};
+        const uint32_t key = static_cast<uint32_t>(uid);
+        attr.map_fd = static_cast<uint32_t>(fd);
+        attr.key = reinterpret_cast<uint64_t>(&key);
+        attr.value = reinterpret_cast<uint64_t>(&value);
+        const int rc = static_cast<int>(syscall(__NR_bpf, BPF_MAP_LOOKUP_ELEM, &attr, sizeof(attr)));
+        close(fd);
+        if (rc != 0) return false;
+        totalBytes = value.rxBytes + value.txBytes;
+        return true;
+    }
+
+    void clearActivityState(int uid) {
+        lock_guard<mutex> lock(activityMutex);
+        audioGraceUntil.erase(uid);
+        networkSamples.erase(uid);
+        networkProtected.erase(uid);
+    }
+
+    void clearNetworkState(int uid) {
+        lock_guard<mutex> lock(activityMutex);
+        networkSamples.erase(uid);
+        networkProtected.erase(uid);
+    }
+
+    NetworkActivity sampleNetworkActivity(int uid, uint64_t& speedBytesPerSec) {
+        uint64_t current = 0;
+        if (!readUidTraffic(uid, current)) return NetworkActivity::UNAVAILABLE;
+
+        const auto now = std::chrono::steady_clock::now();
+        lock_guard<mutex> lock(activityMutex);
+        auto it = networkSamples.find(uid);
+        if (it == networkSamples.end()) {
+            networkSamples.emplace(uid, NetworkSample{current, now});
+            return NetworkActivity::SAMPLING; // 建立基线，1 秒后复核
+        }
+
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - it->second.sampledAt).count();
+        if (elapsedMs < NETWORK_SAMPLE_MS) return NetworkActivity::SAMPLING;
+
+        speedBytesPerSec = current >= it->second.totalBytes
+            ? (current - it->second.totalBytes) * 1000ULL / static_cast<uint64_t>(elapsedMs)
+            : 0;
+        it->second = NetworkSample{current, now};
+
+        const bool wasProtected = networkProtected.contains(uid);
+        const uint64_t threshold = wasProtected
+            ? NETWORK_EXIT_BYTES_PER_SEC : NETWORK_ENTER_BYTES_PER_SEC;
+        if (speedBytesPerSec >= threshold) {
+            networkProtected.insert(uid);
+            return NetworkActivity::ACTIVE;
+        }
+        return NetworkActivity::IDLE;
+    }
 
     void handlePendingIntent() {
         int buff[24] = {0};
@@ -1381,7 +1519,9 @@ public:
     // 这里只在"确实有应用即将到期"时才额外问一次前台, 避免无谓的周期性开销。
     void refreshForegroundBeforeFreeze() {
         if (pendingHandleList.empty()) return;
-        if (doze.isScreenOffStandby) return;
+        // Frozen 自带 Doze 关闭时，息屏策略完全交给外部 DeviceIdle 管理器，
+        // 仍需复核宽松前台，不能因内部 standby 标志而降级。
+        if (settings.enableDoze && doze.isScreenOffStandby) return;
 
         bool hasImminent = false;
         for (const auto& [uid, remainSec] : pendingHandleList) {
@@ -1410,14 +1550,14 @@ public:
             refreshForegroundBeforeFreeze(); // 冻结前复核前台(宽松前台放行)
             processPendingApp();//1秒一次
 
-            // 2分钟一次 在亮屏状态检测是否已经息屏  息屏状态则检测是否再次强制进入深度Doze
-            if (doze.checkIfNeedToEnter()) {
+            // 只有启用 Frozen 自带 Doze 时才进入其内部息屏待机状态。
+            // 关闭时由 DeepDoze Enforcer 等外部模块独立管理 DeviceIdle。
+            if (settings.enableDoze && doze.checkIfNeedToEnter()) {
                 curFgBackup = std::move(curForegroundApp); //backup
                 updateAppProcess();
-                //setWakeupLockByLocalSocket(WAKEUP_LOCK::IGNORE); //TODO xposed端改为一律禁止
             }
 
-            if (doze.isScreenOffStandby)continue;// 息屏状态 不用执行 以下功能
+            if (settings.enableDoze && doze.isScreenOffStandby) continue;
             handlePendingIntent();
             systemTools.checkBattery();// 1分钟一次 电池检测
             checkWakeup();// 检查是否有定时解冻
