@@ -1,6 +1,6 @@
 id=Frozen
 name=Frozen
-version=9.0.3-activity-beta1
-versionCode=2026091201
+version=9.0.3-activity-beta2
+versionCode=2026091202
 author=MoWei
-description=第三方安卓墓碑 [测试分支: Re:Kernel v11 + DeepDoze 解耦 + 音频防抖 + UID流量豁免]
+description=第三方安卓墓碑 [测试分支: Re:Kernel v11 + DeepDoze解耦 + 活跃任务保护 + 应用列表自动刷新]
