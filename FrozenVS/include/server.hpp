@@ -408,9 +408,8 @@ public:
         } break;
 
         case MANAGER_CMD::getProcState: {
-            freezer.printProcState();
-            replyPtr = freezeit.getLogPtr();
-            replyLen = freezeit.getLoglen();
+            replyPtr = replyBuf.get();
+            replyLen = freezer.printProcState(replyBuf.get(), REPLY_BUF_SIZE, false);
         } break;
 
         case MANAGER_CMD::setSettingsVar: {

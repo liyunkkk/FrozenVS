@@ -638,83 +638,84 @@ public:
         }
     }
 
-    void printProcState() {
+    size_t printProcState(char* outBuf = nullptr, size_t maxLen = 0, bool logToGlobal = false) {
         START_TIME_COUNT;
-
         DIR* dir = opendir("/proc");
         if (dir == nullptr) {
-            freezeit.logFmt("错误: %s(), [%d]:[%s]\n", __FUNCTION__, errno, strerror(errno));
-            return;
+            if (logToGlobal) {
+                freezeit.logFmt("错误: %s(), [%d]:[%s]\n", __FUNCTION__, errno, strerror(errno));
+            }
+            return 0;
         }
 
-        //int getSignalCnt = 0;
         int totalMiB = 0;
+        int totalSwapMiB = 0;
         set<int> uidSet, pidSet;
-
         lock_guard<mutex> lock(naughtyMutex);
         naughtyApp.clear();
-
-        stackString<1024 * 16> stateStr("进程冻结状态:\n\n PID | MiB |  状 态  | 进 程\n");
-
+        stackString<1024 * 32> stateStr("进程冻结状态:\n\n  PID   RSS  SWAP   UID  状 态  | 进 程\n");
         struct dirent* file;
         while ((file = readdir(dir)) != nullptr) {
             if (file->d_type != DT_DIR || file->d_name[0] < '0' || file->d_name[0] > '9') continue;
-
             const int pid = Fastatoi(file->d_name);
             if (pid <= 100) continue;
-
             const size_t len = Faststrlen(file->d_name);
             char fullPath[64] = "/proc/";
             memcpy(fullPath + 6, file->d_name, len);
 
             struct stat statBuf;
-            if (stat(fullPath, &statBuf))continue;
+            if (stat(fullPath, &statBuf)) continue;
             const int uid = statBuf.st_uid;
             if (!managedApp.contains(uid)) continue;
-
             auto& appInfo = managedApp[uid];
             if (appInfo.isWhitelist()) continue;
-
             memcpy(fullPath + len + 6, "/cmdline", 9);
             char readBuff[256]; // now is cmdline Content
-            if (Utils::readString(fullPath, readBuff, sizeof(readBuff)) == 0)continue;
+            if (Utils::readString(fullPath, readBuff, sizeof(readBuff)) == 0) continue;
             const auto& package = appInfo.package;
             if (strncmp(readBuff, package.c_str(), package.length())) continue;
             const char endChar = readBuff[package.length()]; // 特例 com.android.chrome_zygote 无法binder冻结
-            if (endChar != ':' && endChar != 0)continue;
-
+            if (endChar != ':' && endChar != 0) continue;
             uidSet.insert(uid);
             pidSet.insert(pid);
-
             stackString<256> label(appInfo.label.c_str(), appInfo.label.length());
             if (readBuff[appInfo.package.length()] == ':')
                 label.append(readBuff + appInfo.package.length());
-
             memcpy(fullPath + 6, file->d_name, len);
             memcpy(fullPath + len + 6, "/statm", 7);
             Utils::readString(fullPath, readBuff, sizeof(readBuff)); // now is statm content
             const char* ptr = strchr(readBuff, ' ');
-
             // Unit: 1 page(4KiB) convert to MiB. (Fastatoi(ptr) * 4 / 1024)
             const int memMiB = ptr ? (Fastatoi(ptr + 1) >> 8) : 0;
             totalMiB += memMiB;
 
+            // 读取 Swap (VmSwap)
+            memcpy(fullPath + 6, file->d_name, len);
+            memcpy(fullPath + len + 6, "/status", 8);
+            int swapMiB = 0;
+            char statusBuff[512];
+            if (Utils::readString(fullPath, statusBuff, sizeof(statusBuff)) > 0) {
+                const char* sPtr = strstr(statusBuff, "VmSwap:");
+                if (sPtr) {
+                    swapMiB = Fastatoi(sPtr + 7) >> 10;
+                }
+            }
+            totalSwapMiB += swapMiB;
+
             if (appInfo.isAudioPlaying) {
-                stateStr.appendFmt("%5d %4d 🎵正在播放 %s\n", pid, memMiB, label.c_str());
+                stateStr.appendFmt("%5d %4d %4d %5d 🎵正在播放 %s\n", pid, memMiB, swapMiB, uid, label.c_str());
                 continue;
             }
-
             if (curForegroundApp.contains(uid)) {
-                stateStr.appendFmt("%5d %4d 📱正在前台 %s\n", pid, memMiB, label.c_str());
+                stateStr.appendFmt("%5d %4d %4d %5d 📱正在前台 %s\n", pid, memMiB, swapMiB, uid, label.c_str());
                 continue;
             }
-
             if (pendingHandleList.contains(uid)) {
                 const auto secRemain = pendingHandleList[uid];
                 if (secRemain < 60)
-                    stateStr.appendFmt("%5d %4d ⏳%d秒后冻结 %s\n", pid, memMiB, secRemain, label.c_str());
+                    stateStr.appendFmt("%5d %4d %4d %5d ⏳%d秒后冻结 %s\n", pid, memMiB, swapMiB, uid, secRemain, label.c_str());
                 else
-                    stateStr.appendFmt("%5d %4d ⏳%d分后冻结 %s\n", pid, memMiB, secRemain / 60, label.c_str());
+                    stateStr.appendFmt("%5d %4d %4d %5d ⏳%d分后冻结 %s\n", pid, memMiB, swapMiB, uid, secRemain / 60, label.c_str());
                 continue;
             }
 
@@ -725,8 +726,7 @@ public:
                 pidSet.erase(pid);
                 continue;
             }
-
-            stateStr.appendFmt("%5d %4d ", pid, memMiB);
+            stateStr.appendFmt("%5d %4d %4d %5d ", pid, memMiB, swapMiB, uid);
             if (!strcmp(readBuff, v2wchan) || !strcmp(readBuff, v2xwchan)) {
                 stateStr.appendFmt("❄️V2冻结中 %s\n", label.c_str());
             }
@@ -757,26 +757,34 @@ public:
             }
         }
         closedir(dir);
-
         if (uidSet.empty()) {
-            freezeit.log("后台很干净，一个黑名单应用都没有");
+            stateStr.append("后台很干净，一个黑名单应用都没有\n");
         }
         else {
             if (!naughtyApp.empty()) {
                 stateStr.append("\n 发现 [未冻结状态] 的进程, 即将进行冻结\n");
-                for (const int uid : naughtyApp) 
-                    pendingHandleList[uid] = 1;
+                if (logToGlobal) {
+                    for (const int uid : naughtyApp)
+                        pendingHandleList[uid] = 1;
+                }
             }
+            stateStr.appendFmt("\n总计 %d 应用 %d 进程, 占用内存 %.2f GiB, SWAP %.2f GiB\n",
+                (int)uidSet.size(), (int)pidSet.size(), totalMiB / 1024.0, totalSwapMiB / 1024.0);
+        }
 
-            stateStr.appendFmt("\n总计 %d 应用 %d 进程, 占用内存 ", (int)uidSet.size(), (int)pidSet.size());
-            stateStr.appendFmt("%.2f GiB", totalMiB / 1024.0);
-
+        if (logToGlobal) {
             freezeit.log(string_view(stateStr.c_str(), stateStr.length));
         }
 
+        size_t copyLen = 0;
+        if (outBuf != nullptr && maxLen > 0) {
+            copyLen = std::min(maxLen - 1, (size_t)stateStr.length);
+            memcpy(outBuf, stateStr.c_str(), copyLen);
+            outBuf[copyLen] = '\0';
+        }
         END_TIME_COUNT;
+        return copyLen;
     }
-
     // 解冻新APP, 旧APP加入待冻结列队
     void updateAppProcess() {
         bool isupdate = false;
