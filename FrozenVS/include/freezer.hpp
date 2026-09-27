@@ -6,18 +6,8 @@
 #include "doze.hpp"
 #include "freezeit.hpp"
 #include "systemTools.hpp"
+#include "rekernel.hpp"
 
-
-#define PACKET_SIZE      256
-#define USER_PORT        100
-#define MAX_PLOAD        125
-#define MSG_LEN          125
-
-typedef struct _user_msg_info
-{
-    struct nlmsghdr hdr;
-    char  msg[MSG_LEN];
-} user_msg_info;
 
 class Freezer {
 private:
@@ -41,8 +31,34 @@ private:
 
     uint32_t timelineIdx = 0;
     uint32_t unfrozenTimeline[4096] = {};
-
     bool specialPlanV2Uid = false;
+
+    ReKernel reKernel;                             // Re:Kernel 通信层(genl / legacy 双传输)
+    unordered_set<int> monitoredNetUid;            // 已向内核登记网络事件订阅的 uid
+    mutex netMonitorMutex;
+
+    // 连续任务保护。音频主信号来自 FrozenApp 的播放器状态；声卡仅作为兜底。
+    // 网络保护采用“到期前短暂采样 UID 流量”的按需策略，避免常驻轮询打扰深睡。
+    static constexpr int AUDIO_GRACE_SECONDS = 15;
+    static constexpr int NETWORK_RECHECK_SECONDS = 10;
+    static constexpr int NETWORK_SAMPLE_MS = 1000;
+    static constexpr uint64_t NETWORK_ENTER_BYTES_PER_SEC = 32ULL * 1024ULL;
+    static constexpr uint64_t NETWORK_EXIT_BYTES_PER_SEC = 8ULL * 1024ULL;
+    unordered_map<int, time_t> audioGraceUntil;
+    enum class NetworkActivity {
+        UNAVAILABLE,
+        SAMPLING,
+        IDLE,
+        ACTIVE,
+    };
+    struct NetworkSample {
+        uint64_t totalBytes;
+        std::chrono::steady_clock::time_point sampledAt;
+    };
+    unordered_map<int, NetworkSample> networkSamples;
+    unordered_set<int> networkProtected;
+    mutex activityMutex;
+
 
     static constexpr size_t GET_VISIBLE_BUF_SIZE = 256 * 1024;
     unique_ptr<char[]> getVisibleAppBuff;
@@ -442,8 +458,12 @@ public:
                 appInfo.timelineUnfrozenIdx = -1;
             }
         }
-        
         appInfo.isFreeze = freeze; 
+
+        // Re:Kernel v11.0 的网络事件需要按 uid 订阅, 冻结时登记, 解冻时撤销
+        if (appInfo.isSignalOrFreezer())
+            syncNetMonitor(appInfo.uid, freeze);
+
 
         if (freeze && (appInfo.needBreakNetwork() || settings.enableBreakNetWork)) 
             breakNetWork(appInfo);
@@ -574,7 +594,9 @@ public:
     }
 
     bool checkReKernel() const  {
-        return (!access("/proc/rekernel/", F_OK));
+        // v11.0 起默认走 Generic Netlink, /proc/rekernel 不再必然存在,
+        // 因此这里必须同时探测 genl family, 否则会误判为"未安装"。
+        return ReKernel::isInstalled();
     }
 
 
@@ -616,83 +638,84 @@ public:
         }
     }
 
-    void printProcState() {
+    size_t printProcState(char* outBuf = nullptr, size_t maxLen = 0, bool logToGlobal = false) {
         START_TIME_COUNT;
-
         DIR* dir = opendir("/proc");
         if (dir == nullptr) {
-            freezeit.logFmt("错误: %s(), [%d]:[%s]\n", __FUNCTION__, errno, strerror(errno));
-            return;
+            if (logToGlobal) {
+                freezeit.logFmt("错误: %s(), [%d]:[%s]\n", __FUNCTION__, errno, strerror(errno));
+            }
+            return 0;
         }
 
-        //int getSignalCnt = 0;
         int totalMiB = 0;
+        int totalSwapMiB = 0;
         set<int> uidSet, pidSet;
-
         lock_guard<mutex> lock(naughtyMutex);
         naughtyApp.clear();
-
-        stackString<1024 * 16> stateStr("进程冻结状态:\n\n PID | MiB |  状 态  | 进 程\n");
-
+        stackString<1024 * 32> stateStr("进程冻结状态:\n\n  PID   RSS  SWAP   UID  状 态  | 进 程\n");
         struct dirent* file;
         while ((file = readdir(dir)) != nullptr) {
             if (file->d_type != DT_DIR || file->d_name[0] < '0' || file->d_name[0] > '9') continue;
-
             const int pid = Fastatoi(file->d_name);
             if (pid <= 100) continue;
-
             const size_t len = Faststrlen(file->d_name);
             char fullPath[64] = "/proc/";
             memcpy(fullPath + 6, file->d_name, len);
 
             struct stat statBuf;
-            if (stat(fullPath, &statBuf))continue;
+            if (stat(fullPath, &statBuf)) continue;
             const int uid = statBuf.st_uid;
             if (!managedApp.contains(uid)) continue;
-
             auto& appInfo = managedApp[uid];
             if (appInfo.isWhitelist()) continue;
-
             memcpy(fullPath + len + 6, "/cmdline", 9);
             char readBuff[256]; // now is cmdline Content
-            if (Utils::readString(fullPath, readBuff, sizeof(readBuff)) == 0)continue;
+            if (Utils::readString(fullPath, readBuff, sizeof(readBuff)) == 0) continue;
             const auto& package = appInfo.package;
             if (strncmp(readBuff, package.c_str(), package.length())) continue;
             const char endChar = readBuff[package.length()]; // 特例 com.android.chrome_zygote 无法binder冻结
-            if (endChar != ':' && endChar != 0)continue;
-
+            if (endChar != ':' && endChar != 0) continue;
             uidSet.insert(uid);
             pidSet.insert(pid);
-
             stackString<256> label(appInfo.label.c_str(), appInfo.label.length());
             if (readBuff[appInfo.package.length()] == ':')
                 label.append(readBuff + appInfo.package.length());
-
             memcpy(fullPath + 6, file->d_name, len);
             memcpy(fullPath + len + 6, "/statm", 7);
             Utils::readString(fullPath, readBuff, sizeof(readBuff)); // now is statm content
             const char* ptr = strchr(readBuff, ' ');
-
             // Unit: 1 page(4KiB) convert to MiB. (Fastatoi(ptr) * 4 / 1024)
             const int memMiB = ptr ? (Fastatoi(ptr + 1) >> 8) : 0;
             totalMiB += memMiB;
 
+            // 读取 Swap (VmSwap)
+            memcpy(fullPath + 6, file->d_name, len);
+            memcpy(fullPath + len + 6, "/status", 8);
+            int swapMiB = 0;
+            char statusBuff[512];
+            if (Utils::readString(fullPath, statusBuff, sizeof(statusBuff)) > 0) {
+                const char* sPtr = strstr(statusBuff, "VmSwap:");
+                if (sPtr) {
+                    swapMiB = Fastatoi(sPtr + 7) >> 10;
+                }
+            }
+            totalSwapMiB += swapMiB;
+
             if (appInfo.isAudioPlaying) {
-                stateStr.appendFmt("%5d %4d 🎵正在播放 %s\n", pid, memMiB, label.c_str());
+                stateStr.appendFmt("%5d %4d %4d %5d 🎵正在播放 %s\n", pid, memMiB, swapMiB, uid, label.c_str());
                 continue;
             }
-
             if (curForegroundApp.contains(uid)) {
-                stateStr.appendFmt("%5d %4d 📱正在前台 %s\n", pid, memMiB, label.c_str());
+                stateStr.appendFmt("%5d %4d %4d %5d 📱正在前台 %s\n", pid, memMiB, swapMiB, uid, label.c_str());
                 continue;
             }
-
             if (pendingHandleList.contains(uid)) {
                 const auto secRemain = pendingHandleList[uid];
                 if (secRemain < 60)
-                    stateStr.appendFmt("%5d %4d ⏳%d秒后冻结 %s\n", pid, memMiB, secRemain, label.c_str());
+                    stateStr.appendFmt("%5d %4d %4d %5d ⏳%d秒后冻结 %s\n", pid, memMiB, swapMiB, uid, secRemain, label.c_str());
                 else
-                    stateStr.appendFmt("%5d %4d ⏳%d分后冻结 %s\n", pid, memMiB, secRemain / 60, label.c_str());
+                    stateStr.appendFmt("%5d %4d %4d %5d ⏳%d分后冻结 %s\n", pid, memMiB, swapMiB, uid, secRemain / 60, label.c_str());
                 continue;
             }
 
@@ -703,8 +726,7 @@ public:
                 pidSet.erase(pid);
                 continue;
             }
-
-            stateStr.appendFmt("%5d %4d ", pid, memMiB);
+            stateStr.appendFmt("%5d %4d %4d %5d ", pid, memMiB, swapMiB, uid);
             if (!strcmp(readBuff, v2wchan) || !strcmp(readBuff, v2xwchan)) {
                 stateStr.appendFmt("❄️V2冻结中 %s\n", label.c_str());
             }
@@ -735,26 +757,34 @@ public:
             }
         }
         closedir(dir);
-
         if (uidSet.empty()) {
-            freezeit.log("后台很干净，一个黑名单应用都没有");
+            stateStr.append("后台很干净，一个黑名单应用都没有\n");
         }
         else {
             if (!naughtyApp.empty()) {
                 stateStr.append("\n 发现 [未冻结状态] 的进程, 即将进行冻结\n");
-                for (const int uid : naughtyApp) 
-                    pendingHandleList[uid] = 1;
+                if (logToGlobal) {
+                    for (const int uid : naughtyApp)
+                        pendingHandleList[uid] = 1;
+                }
             }
+            stateStr.appendFmt("\n总计 %d 应用 %d 进程, 占用内存 %.2f GiB, SWAP %.2f GiB\n",
+                (int)uidSet.size(), (int)pidSet.size(), totalMiB / 1024.0, totalSwapMiB / 1024.0);
+        }
 
-            stateStr.appendFmt("\n总计 %d 应用 %d 进程, 占用内存 ", (int)uidSet.size(), (int)pidSet.size());
-            stateStr.appendFmt("%.2f GiB", totalMiB / 1024.0);
-
+        if (logToGlobal) {
             freezeit.log(string_view(stateStr.c_str(), stateStr.length));
         }
 
+        size_t copyLen = 0;
+        if (outBuf != nullptr && maxLen > 0) {
+            copyLen = std::min(maxLen - 1, (size_t)stateStr.length);
+            memcpy(outBuf, stateStr.c_str(), copyLen);
+            outBuf[copyLen] = '\0';
+        }
         END_TIME_COUNT;
+        return copyLen;
     }
-
     // 解冻新APP, 旧APP加入待冻结列队
     void updateAppProcess() {
         bool isupdate = false;
@@ -774,6 +804,7 @@ public:
             return;
 
         for (const int uid : newShowOnApp) {
+            clearActivityState(uid);
             // 如果在待冻结列表则只需移除
             if (pendingHandleList.erase(uid)) {
                 isupdate = true;
@@ -814,17 +845,48 @@ public:
 
             const int uid = it->first;
             auto& appInfo = managedApp[uid];
-
-            if (appInfo.isAudioPlaying) { // 不该被冻结
-                it++;    
+            if (appInfo.isAudioPlaying) { // 正在播放，不该被冻结
+                remainSec = 1;
+                it++;
                 continue;
             }
-
-            if (appInfo.isWhitelist() && curForegroundApp.contains(uid)) { // 刚切换成白名单的和已经被冻结过的
+            if (appInfo.isWhitelist()) { // 刚切换成白名单的
                 it = pendingHandleList.erase(it);
+                isupdate = true;
                 continue;
             }
-
+            if (curForegroundApp.contains(uid)) { // 前台应用(含宽松前台)不应该在待冻结列表中
+                it = pendingHandleList.erase(it);
+                isupdate = true;
+                continue;
+            }
+            {
+                lock_guard<mutex> lock(activityMutex);
+                const auto grace = audioGraceUntil.find(uid);
+                if (grace != audioGraceUntil.end()) {
+                    const time_t now = time(nullptr);
+                    if (grace->second > now) {
+                        remainSec = std::max(1, static_cast<int>(grace->second - now));
+                        it++;
+                        continue;
+                    }
+                    audioGraceUntil.erase(grace);
+                }
+            }
+            if (appInfo.isPermissive) {
+                uint64_t speed = 0;
+                const NetworkActivity activity = sampleNetworkActivity(uid, speed);
+                if (activity == NetworkActivity::SAMPLING || activity == NetworkActivity::ACTIVE) {
+                    remainSec = activity == NetworkActivity::ACTIVE ? NETWORK_RECHECK_SECONDS : 1;
+                    if (activity == NetworkActivity::ACTIVE)
+                        freezeit.logFmt("暂缓冻结 %s: 网络活跃 %llu KiB/s",
+                            appInfo.label.c_str(),
+                            static_cast<unsigned long long>(speed / 1024ULL));
+                    it++;
+                    continue;
+                }
+            }
+            clearNetworkState(uid);
             int num = handleProcess(appInfo, true);
             if (num < 0) {
                 if (appInfo.delayCnt >= 5) {
@@ -1084,64 +1146,170 @@ public:
         END_TIME_COUNT;
     }
 
+    // 音频放行。
+    // 旧实现有三个缺陷:
+    //   1) 整个循环被 systemTools.isAudioPlaying 门控, 而该标志来自 /dev/snd 的
+    //      inotify 计数, 计数漂移(守护进程启动前已在播放 / 事件丢失)后会长期为 false,
+    //      导致正在放音频的宽松应用被冻结;
+    //   2) 任何一次 localSocket 失败直接 return, 音频监听线程永久退出;
+    //   3) 门控为 false 时不再清理 isAudioPlaying, 已停止播放的应用可能永不冻结。
+    // 现在: 常态低频轮询, 有音频时提高频率, 失败只记一次日志并继续。
     void getAudioByLocalSocket() {
-        sleep(5); 
+        sleep(5);
+
+        bool errorLogged = false;
+        int idleCnt = 0;
 
         while (true) {
-            if (systemTools.isAudioPlaying) {
-                int buff[24] = {};  
-
-                int recvLen = Utils::localSocketRequest(XPOSED_CMD::GET_AUDIO, nullptr, 0, buff, 
-                    sizeof(buff));
-
-                if (recvLen <= 0) {
-                    freezeit.logFmt("%s() 工作异常, 请确认LSPosed中Frozen是否已经勾选系统框架", __FUNCTION__);
-                    return;
-                }
-                else if (recvLen < 4) {
-                    freezeit.logFmt("%s() 返回数据异常 recvLen[%d]", __FUNCTION__, recvLen);
-                    if (recvLen > 0 && recvLen < 64 * 4)
-                        freezeit.logFmt("DumpHex: %s", Utils::bin2Hex(buff, recvLen).c_str());
-                    return;
-                }
-
-                const int uidCount = (recvLen / 4) - 1; 
-
-                currentAudioApp.clear();
-
-                for (int i = 0; i < uidCount; ++i) {
-                    int uid = buff[i];
-
-                    if (!managedApp.contains(uid)) continue;
-                            
-                    auto& appInfo = managedApp[uid];
-                    if (appInfo.isWhitelist()) continue;
-                    
-                    if (appInfo.isPermissive) {
-                        if (appInfo.package == "com.ss.android.ugc.aweme" 
-                                || appInfo.package == "com.ss.android.ugc.aweme.lite") continue;
-                        appInfo.isAudioPlaying = true;
-                        currentAudioApp.emplace_back(uid);
-                    }
-                }
-
-                for (int lastUid : lastAudioApp) {
-                    bool stillPlaying = false;
-                    for (int curUid : currentAudioApp) {
-                        if (curUid == lastUid) {
-                            stillPlaying = true;
-                            break;
-                        }
-                    }
-                    
-                    if (!stillPlaying) 
-                        managedApp[lastUid].isAudioPlaying = false;
-                }
-
-                lastAudioApp = std::move(currentAudioApp); 
+            // 有音频活动时 500ms 一次; 否则每 5 秒复核一次, 用于兜底修正计数漂移
+            const bool active = systemTools.isAudioPlaying;
+            if (!active && ++idleCnt < 10) {
+                Utils::sleep_ms(500);
+                continue;
             }
+            idleCnt = 0;
+
+            int buff[24] = {};
+            const int recvLen = Utils::localSocketRequest(XPOSED_CMD::GET_AUDIO, nullptr, 0, buff,
+                sizeof(buff));
+
+            if (recvLen < 4) {
+                if (!errorLogged) {
+                    errorLogged = true;
+                    freezeit.logFmt("%s() 工作异常, 请确认LSPosed中Frozen是否已经勾选系统框架", __FUNCTION__);
+                }
+                Utils::sleep_ms(2000);
+                continue;
+            }
+            errorLogged = false;
+
+            const int uidCount = (recvLen / 4) - 1;
+
+            currentAudioApp.clear();
+
+            for (int i = 0; i < uidCount; ++i) {
+                const int uid = buff[i];
+
+                if (!managedApp.contains(uid)) continue;
+
+                auto& appInfo = managedApp[uid];
+                if (appInfo.isWhitelist()) continue;
+                if (!appInfo.isPermissive) continue;  // 严格前台: 音频不算前台
+
+                appInfo.isAudioPlaying = true;
+                {
+                    lock_guard<mutex> lock(activityMutex);
+                    audioGraceUntil.erase(uid);
+                }
+                currentAudioApp.emplace_back(uid);
+            }
+
+            for (const int lastUid : lastAudioApp) {
+                bool stillPlaying = false;
+                for (const int curUid : currentAudioApp) {
+                    if (curUid == lastUid) {
+                        stillPlaying = true;
+                        break;
+                    }
+                }
+
+                if (!stillPlaying && managedApp.contains(lastUid)) {
+                    auto& appInfo = managedApp[lastUid];
+                    appInfo.isAudioPlaying = false;
+                    if (appInfo.isPermissive) {
+                        lock_guard<mutex> lock(activityMutex);
+                        audioGraceUntil[lastUid] = time(nullptr) + AUDIO_GRACE_SECONDS;
+                    }
+                }
+            }
+
+            lastAudioApp = std::move(currentAudioApp);
+
             Utils::sleep_ms(500);
         }
+    }
+
+
+    static int openPinnedBpfMap(const char* path) {
+        union bpf_attr attr{};
+        attr.pathname = reinterpret_cast<uint64_t>(path);
+        return static_cast<int>(syscall(__NR_bpf, BPF_OBJ_GET, &attr, sizeof(attr)));
+    }
+
+    static bool readUidTraffic(int uid, uint64_t& totalBytes) {
+        // Android netd 的 app_uid_stats_map: key 为 uint32_t UID，value 为 StatsValue。
+        // pinned BPF 对象不能用 open(2) 当作 map fd，必须通过 BPF_OBJ_GET 获取。
+        constexpr const char* paths[] = {
+            "/sys/fs/bpf/netd_shared/map_netd_app_uid_stats_map",
+            "/sys/fs/bpf/map_netd_app_uid_stats_map", // Android 旧布局兜底
+        };
+        int fd = -1;
+        for (const char* path : paths) {
+            fd = openPinnedBpfMap(path);
+            if (fd >= 0) break;
+        }
+        if (fd < 0) return false;
+
+        struct AppUidStatsValue {
+            uint64_t rxPackets;
+            uint64_t rxBytes;
+            uint64_t txPackets;
+            uint64_t txBytes;
+        } value{};
+        union bpf_attr attr{};
+        const uint32_t key = static_cast<uint32_t>(uid);
+        attr.map_fd = static_cast<uint32_t>(fd);
+        attr.key = reinterpret_cast<uint64_t>(&key);
+        attr.value = reinterpret_cast<uint64_t>(&value);
+        const int rc = static_cast<int>(syscall(__NR_bpf, BPF_MAP_LOOKUP_ELEM, &attr, sizeof(attr)));
+        close(fd);
+        if (rc != 0) return false;
+        totalBytes = value.rxBytes + value.txBytes;
+        return true;
+    }
+
+    void clearActivityState(int uid) {
+        lock_guard<mutex> lock(activityMutex);
+        audioGraceUntil.erase(uid);
+        networkSamples.erase(uid);
+        networkProtected.erase(uid);
+    }
+
+    void clearNetworkState(int uid) {
+        lock_guard<mutex> lock(activityMutex);
+        networkSamples.erase(uid);
+        networkProtected.erase(uid);
+    }
+
+    NetworkActivity sampleNetworkActivity(int uid, uint64_t& speedBytesPerSec) {
+        uint64_t current = 0;
+        if (!readUidTraffic(uid, current)) return NetworkActivity::UNAVAILABLE;
+
+        const auto now = std::chrono::steady_clock::now();
+        lock_guard<mutex> lock(activityMutex);
+        auto it = networkSamples.find(uid);
+        if (it == networkSamples.end()) {
+            networkSamples.emplace(uid, NetworkSample{current, now});
+            return NetworkActivity::SAMPLING; // 建立基线，1 秒后复核
+        }
+
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - it->second.sampledAt).count();
+        if (elapsedMs < NETWORK_SAMPLE_MS) return NetworkActivity::SAMPLING;
+
+        speedBytesPerSec = current >= it->second.totalBytes
+            ? (current - it->second.totalBytes) * 1000ULL / static_cast<uint64_t>(elapsedMs)
+            : 0;
+        it->second = NetworkSample{current, now};
+
+        const bool wasProtected = networkProtected.contains(uid);
+        const uint64_t threshold = wasProtected
+            ? NETWORK_EXIT_BYTES_PER_SEC : NETWORK_ENTER_BYTES_PER_SEC;
+        if (speedBytesPerSec >= threshold) {
+            networkProtected.insert(uid);
+            return NetworkActivity::ACTIVE;
+        }
+        return NetworkActivity::IDLE;
     }
 
     void handlePendingIntent() {
@@ -1240,151 +1408,142 @@ public:
         freezeit.log("已退出监控同步事件: 0xB0");
     }
 
-    int getReKernelPort() {
-        auto dir = opendir("/proc/rekernel"); 
-        if (dir == nullptr) return -1;
-
-        int port = -1;
-        struct dirent *file;
-        while ((file = readdir(dir))) {
-            if (file->d_name[0] == '.') continue;  
-
-            if (file->d_name[1] == '2') {
-                closedir(dir);
-                return 22; 
-            } else if (file->d_name[1] == '6') {
-                closedir(dir);
-                return 26;  
-            }
-            
-            if (file->d_name[1] >= '3' && file->d_name[1] <= '5') {
-                port = 20 + (file->d_name[1] - '0');
-            }
-        }
-
-        closedir(dir);
-        return port;  
-    }
-
     // Binder事件 需要额外magisk模块: ReKernel
+    // v11.0 起传输层由 rekernel.hpp 统一封装(Generic Netlink 优先, legacy 回退)
     void binderEventTriggerTask() {
         if (!settings.enableunFreezerTemporary) return;
-        int skfd, ret;
-        user_msg_info u_info{};
-        socklen_t len;
-        struct sockaddr_nl saddr {}, daddr{};
-        constexpr const char umsg[] = "Hello! Re:Kernel!";
-        constexpr const char str[] = "#proc_remove";
 
-        if (!checkReKernel()) {
-            freezeit.log("ReKernel未安装");
-            return;
-        }
-
-        const int NETLINK_TEST = getReKernelPort();
-
-        freezeit.logFmt("已连接至ReKernel: %d#100", NETLINK_TEST);
-
-        struct nlmsghdr* nlh = (struct nlmsghdr*)malloc(NLMSG_SPACE(MAX_PLOAD));
+        char msg[1024];
 
         while (true) {
-            skfd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_TEST);
-            if (skfd == -1) {
-                freezeit.log("ReKernel AF_NETLINK 创建失败");
+            if (!checkReKernel()) {
+                freezeit.log("ReKernel未安装");
+                return;
+            }
+
+            if (!reKernel.connect()) {
+                freezeit.log("ReKernel 连接失败, 60秒后重试");
                 sleep(60);
                 continue;
             }
 
-            memset(&saddr, 0, sizeof(saddr));
-            saddr.nl_family = AF_NETLINK;
-            saddr.nl_pid = USER_PORT;
-            saddr.nl_groups = 0;
-            if (bind(skfd, (struct sockaddr*)&saddr, sizeof(saddr)) != 0) {
-                close(skfd);
+            const auto ver = reKernel.queryVersion();
+            if (reKernel.transport() == ReKernel::Transport::LEGACY)
+                freezeit.logFmt("已连接至ReKernel: %s %d#%d %s", reKernel.transportName(),
+                    reKernel.legacyUnit(), ReKernel::LEGACY_USER_PORT,
+                    ver.empty() ? "" : ver.c_str());
+            else
+                freezeit.logFmt("已连接至ReKernel: %s%s%s", reKernel.transportName(),
+                    ver.empty() ? "" : " v", ver.c_str());
 
-                freezeit.log("ReKernel bind 失败");
-                sleep(60);
-                continue;
-            }
+            // 重连后需要重新登记网络事件订阅
+            resyncNetMonitorAll();
 
-            memset(&daddr, 0, sizeof(daddr));
-            daddr.nl_family = AF_NETLINK;
-            daddr.nl_pid = 0;
-            daddr.nl_groups = 0;
-
-            memset(nlh, 0, sizeof(struct nlmsghdr));
-            nlh->nlmsg_len = NLMSG_SPACE(MAX_PLOAD);
-            nlh->nlmsg_flags = 0;
-            nlh->nlmsg_type = 0;
-            nlh->nlmsg_seq = 0;
-            nlh->nlmsg_pid = saddr.nl_pid;
-
-            memcpy(NLMSG_DATA(nlh), umsg, sizeof(umsg) - 1);
-            //freezeit.logFmt("Send msg to kernel:%s", umsg);
-
-            ret = sendto(skfd, nlh, nlh->nlmsg_len, 0, (struct sockaddr*)&daddr, sizeof(struct sockaddr_nl));
-            if (!ret) {
-                close(skfd);
-
-                freezeit.log("ReKernel Failed send msg to kernel");
-                sleep(60);
-                continue;
-            }
-
-            memcpy(NLMSG_DATA(nlh), str, sizeof(str) - 1); 
-        
-            ret = sendto(skfd, nlh, nlh->nlmsg_len, 0, (struct sockaddr *)&daddr, sizeof(struct sockaddr_nl));
-            if (!ret) freezeit.logFmt("通知ReKernel清理 /proc/rekernel/%d 节点失败", NETLINK_TEST);  
-            
             while (true) {
-                memset(&u_info, 0, sizeof(u_info));
-                len = sizeof(struct sockaddr_nl);
-                ret = recvfrom(skfd, &u_info, sizeof(user_msg_info), 0, (struct sockaddr*)&daddr, &len);
-                if (!ret) {
-                    freezeit.log("ReKernel Failed recv msg from kernel!");
+                const int len = reKernel.recvEvent(msg, sizeof(msg));
+                if (len < 0) {
+                    freezeit.log("ReKernel 链路异常, 将重新连接");
                     break;
                 }
+                if (len == 0) continue;
 
-                const char* isBinder = strstr(u_info.msg, "type=Binder");
-                const char* isNetwork = strstr(u_info.msg, "type=Network");
-                const char* targetUid = strstr(u_info.msg, "target=");
+                handleReKernelEvent(msg);
+            }
 
-                if (isBinder) {
-                    const char* ptr = strstr(u_info.msg, "oneway=");
-                    const char* ptr2 = strstr(u_info.msg, "bindertype=free_buffer_full");
-                    const int oneway = Fastatoi(ptr + 7);
-
-                    if (oneway == 1 && ptr2 == nullptr) continue;
-
-                    const int uid = Fastatoi(targetUid + 7);
-
-                    if (!managedApp.contains(uid)) continue;
-                        
-                    auto& appInfo = managedApp[uid];
-
-                    if (appInfo.isFreeze && !pendingHandleList.contains(uid) && !curForegroundApp.contains(uid)) {
-                        unFreezerTemporary(uid);
-                        freezeit.logFmt("[%s] 接收到Re:Kernel的Binder信息, 类别: %s 类型: 临时解冻, 将进行临时解冻",
-                            managedApp[uid].label.c_str(), oneway ? "AYSNC" : "SYNC");  
-                    }
-                } else if (isNetwork && settings.enableNetWorkUnFreeze) {
-                    const int uid = Fastatoi(targetUid + 7);
-
-                    if (!managedApp.contains(uid)) continue;
-                    auto& appInfo = managedApp[uid];
-
-                    if (appInfo.isFreeze && !pendingHandleList.contains(uid) && !curForegroundApp.contains(uid)) {
-                        unFreezerTemporary(uid);
-                        freezeit.logFmt("[%s] 接收到Re:Kernel的网络信息, 类型: 网络解冻, 将进行临时解冻",
-                            managedApp[uid].label.c_str());  
-                    }
-                }
-            }  
+            reKernel.closeSocket();
+            sleep(5);
         }
-        close(skfd);
-        free(nlh);
     }
 
+    void handleReKernelEvent(const char* msg) {
+        const char* targetUid = strstr(msg, "target=");
+        if (targetUid == nullptr) return;
+
+        const int uid = Fastatoi(targetUid + 7);
+        if (!managedApp.contains(uid)) return;
+        auto& appInfo = managedApp[uid];
+
+        if (strstr(msg, "type=Binder")) {
+            const char* ptr = strstr(msg, "oneway=");
+            const char* ptr2 = strstr(msg, "bindertype=free_buffer_full");
+            const int oneway = ptr ? Fastatoi(ptr + 7) : 0;
+
+            if (oneway == 1 && ptr2 == nullptr) return;
+
+            if (appInfo.isFreeze && !pendingHandleList.contains(uid) &&
+                !curForegroundApp.contains(uid)) {
+                unFreezerTemporary(uid);
+                freezeit.logFmt("[%s] 接收到Re:Kernel的Binder信息, 类别: %s 类型: 临时解冻, 将进行临时解冻",
+                    appInfo.label.c_str(), oneway ? "AYSNC" : "SYNC");
+            }
+        }
+        else if (strstr(msg, "type=Network") && settings.enableNetWorkUnFreeze) {
+            if (appInfo.isFreeze && !pendingHandleList.contains(uid) &&
+                !curForegroundApp.contains(uid)) {
+                unFreezerTemporary(uid);
+                freezeit.logFmt("[%s] 接收到Re:Kernel的网络信息, 类型: 网络解冻, 将进行临时解冻",
+                    appInfo.label.c_str());
+            }
+        }
+    }
+
+    // v11.0 的 netfilter 钩子里有 net_uid_monitored(uid) 门控:
+    // 不主动订阅则永远收不到 type=Network 事件, 网络解冻会静默失效。
+    void syncNetMonitor(const int uid, const bool needed) {
+        if (!settings.enableNetWorkUnFreeze) return;
+        if (!reKernel.isConnected()) return;
+
+        lock_guard<mutex> lock(netMonitorMutex);
+        if (needed) {
+            if (monitoredNetUid.contains(uid)) return;
+            if (reKernel.monitorNet(uid, true)) monitoredNetUid.insert(uid);
+        }
+        else {
+            if (!monitoredNetUid.contains(uid)) return;
+            reKernel.monitorNet(uid, false);
+            monitoredNetUid.erase(uid);
+        }
+    }
+
+    void resyncNetMonitorAll() {
+        if (!settings.enableNetWorkUnFreeze) return;
+        if (!reKernel.isConnected()) return;
+
+        lock_guard<mutex> lock(netMonitorMutex);
+        monitoredNetUid.clear();
+        for (int uid = ManagedApp::UID_START; uid < ManagedApp::UID_END; uid++) {
+            if (!managedApp.contains(uid)) continue;
+            auto& appInfo = managedApp[uid];
+            if (!appInfo.isFreeze || !appInfo.isSignalOrFreezer()) continue;
+            if (reKernel.monitorNet(uid, true)) monitoredNetUid.insert(uid);
+        }
+    }
+
+
+    // 冻结前复核前台状态。
+    // top-app cpuset 的 inotify 只在"顶层应用切换"时触发, 而宽松前台的场景
+    // (悬浮窗 / 常驻通知 / 前台服务, 即 mCurProcState 4~6) 并不会进入 top-app,
+    // 因此 curForegroundApp 可能仍是切后台那一刻的旧快照, 导致宽松前台被误冻结。
+    // 这里只在"确实有应用即将到期"时才额外问一次前台, 避免无谓的周期性开销。
+    void refreshForegroundBeforeFreeze() {
+        if (pendingHandleList.empty()) return;
+        // Frozen 自带 Doze 关闭时，息屏策略完全交给外部 DeviceIdle 管理器，
+        // 仍需复核宽松前台，不能因内部 standby 标志而降级。
+        if (settings.enableDoze && doze.isScreenOffStandby) return;
+
+        bool hasImminent = false;
+        for (const auto& [uid, remainSec] : pendingHandleList) {
+            if (remainSec <= 2) { hasImminent = true; break; }
+        }
+        if (!hasImminent) return;
+
+        if (freezeit.SDK_INT_VER >= 31)
+            getVisibleAppByLocalSocket();
+        else
+            getVisibleAppByShellLRU();
+
+        updateAppProcess();
+    }
 
     void cycleThreadFunc() {
 
@@ -1396,16 +1555,17 @@ public:
         
             systemTools.cycleCnt++;
 
+            refreshForegroundBeforeFreeze(); // 冻结前复核前台(宽松前台放行)
             processPendingApp();//1秒一次
 
-            // 2分钟一次 在亮屏状态检测是否已经息屏  息屏状态则检测是否再次强制进入深度Doze
-            if (doze.checkIfNeedToEnter()) {
+            // 只有启用 Frozen 自带 Doze 时才进入其内部息屏待机状态。
+            // 关闭时由 DeepDoze Enforcer 等外部模块独立管理 DeviceIdle。
+            if (settings.enableDoze && doze.checkIfNeedToEnter()) {
                 curFgBackup = std::move(curForegroundApp); //backup
                 updateAppProcess();
-                //setWakeupLockByLocalSocket(WAKEUP_LOCK::IGNORE); //TODO xposed端改为一律禁止
             }
 
-            if (doze.isScreenOffStandby)continue;// 息屏状态 不用执行 以下功能
+            if (settings.enableDoze && doze.isScreenOffStandby) continue;
             handlePendingIntent();
             systemTools.checkBattery();// 1分钟一次 电池检测
             checkWakeup();// 检查是否有定时解冻

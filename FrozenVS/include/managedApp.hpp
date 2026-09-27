@@ -607,7 +607,9 @@ public:
         uidIndex.clear();
         for (const auto& [uid, package] : allAppList) {
             uidIndex[package] = uid;        // 更新 按包名取UID
-            if (contains(uid))continue;
+            // Android 可能很快复用已卸载应用的 UID。仅比较 UID 会把旧应用的
+            // 名称、冻结策略和运行状态错误继承给新应用，因此包名变化必须重建。
+            if (contains(uid) && appInfoMap[uid - UID_START].package == package) continue;
 
             const bool isSYS = !thirdAppList.contains(uid);
             appInfoMap[uid - UID_START] = appInfoStruct{
@@ -627,14 +629,15 @@ public:
                 .pids = {},
             };
         }
-        // 移除已卸载应用
+        // 移除已卸载应用。必须同时比较包名，避免 UID 已被新安装应用复用时
+        // 把旧记录误认为仍然有效。
         for (auto& appInfo : appInfoMap) {
-            if (appInfo.uid < UID_START || allAppList.contains(appInfo.uid))continue;
+            if (appInfo.uid < UID_START) continue;
+            const auto installed = allAppList.find(appInfo.uid);
+            if (installed != allAppList.end() && installed->second == appInfo.package) continue;
 
+            appInfo = appInfoStruct{};
             appInfo.uid = -1;
-            appInfo.package.clear();
-            appInfo.label.clear();
-            appInfo.pids.clear();
         }
         END_TIME_COUNT;
     }

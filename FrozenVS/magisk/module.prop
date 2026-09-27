@@ -1,6 +1,6 @@
 id=Frozen
 name=Frozen
-version=9.0.3
-versionCode=20260419
+version=10.0
+versionCode=2026092701
 author=MoWei
-description=第三方安卓墓碑，实现堪比"IOS"类似的完美墓碑机制
+description=Frozen

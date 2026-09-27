@@ -34,6 +34,8 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <linux/input.h>
+#include <linux/bpf.h>
+#include <sys/syscall.h>
 #include <linux/android/binder.h>
 #include <linux/netlink.h>
 #include <netinet/tcp.h>
