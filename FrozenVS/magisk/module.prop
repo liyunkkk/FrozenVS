@@ -1,6 +1,6 @@
 id=Frozen
 name=Frozen
-version=9.0.3-activity-beta4
-versionCode=2026091304
+version=10.0
+versionCode=2026092701
 author=MoWei
-description=第三方安卓墓碑 [测试分支: 状态查询免日志污染 + Swap统计支持 + Re:Kernel v11]
+description=Frozen
