@@ -758,6 +758,23 @@ public:
             if (it != uidIndex.end())
                 appInfoMap[it->second - UID_START].freezeMode = FREEZE_MODE::WHITEFORCE;
         }
+
+        // 诊断：列出当前"宽松(permissive)且非白名单"的应用，用于定位宽松冻结不生效
+        {
+            char tmp[2048];
+            int pos = snprintf(tmp, sizeof(tmp), "宽松应用清单:");
+            int cnt = 0;
+            for (const auto& appInfo : appInfoMap) {
+                if (appInfo.uid < UID_START) continue;
+                if (!appInfo.isPermissive || appInfo.isWhitelist()) continue;
+                pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, " %s(%d)",
+                    appInfo.label.c_str(), appInfo.uid);
+                if (pos > (int)sizeof(tmp) - 128) break;
+                if (++cnt >= 40) break;
+            }
+            if (cnt == 0) snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, " 无");
+            freezeit.log(tmp);
+        }
     }
 
     void saveConfig() {

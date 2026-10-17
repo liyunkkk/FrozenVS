@@ -927,17 +927,17 @@ public:
                 // UID 流量为 0 不代表没在下载：TUN / Clash / 代理模式下流量记在代理 UID 上，
                 // 目标应用自身的 netd 计数恒为 0。用进程级 IO + CPU 兜底。
                 uint64_t ioRate = 0, cpuRate = 0;
-                if (sampleProcActivity(uid, ioRate, cpuRate)) {
+                const bool busy = sampleProcActivity(uid, ioRate, cpuRate);
+
+                freezeit.logFmt("宽松判定 %s(%d): 流量IDLE 速度%lluB/s IO%lluB/s CPU%llu/s → %s",
+                    appInfo.label.c_str(), uid,
+                    static_cast<unsigned long long>(speed),
+                    static_cast<unsigned long long>(ioRate),
+                    static_cast<unsigned long long>(cpuRate),
+                    busy ? "放行" : "冻结");
+
+                if (busy) {
                     remainSec = NETWORK_RECHECK_SECONDS;
-                    static time_t lastBusyLog = 0;
-                    const time_t nowBusy = time(nullptr);
-                    if (nowBusy - lastBusyLog > 120) {
-                        lastBusyLog = nowBusy;
-                        freezeit.logFmt("暂缓冻结 %s: 进程活跃 IO %llu B/s CPU %llu jiffies/s (UID流量0, 代理场景)",
-                            appInfo.label.c_str(),
-                            static_cast<unsigned long long>(ioRate),
-                            static_cast<unsigned long long>(cpuRate));
-                    }
                     it++;
                     continue;
                 }

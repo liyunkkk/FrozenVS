@@ -23,5 +23,5 @@ wait_until_login() {
 wait_until_login
 
 sleep 10 # 防止软重启导致的通讯异常
-# 这里可以传递参数 举例"$MODDIR"/Frozen 1 可以实现日志输出在本地"/sdcard/Android/Frozen.log"
-"$MODDIR"/Frozen
+# 带参数 1 启动：日志落盘 /sdcard/Android/Frozen.log（排查宽松冻结用）
+"$MODDIR"/Frozen 1
