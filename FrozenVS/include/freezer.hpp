@@ -668,7 +668,10 @@ public:
             const int uid = statBuf.st_uid;
             if (!managedApp.contains(uid)) continue;
             auto& appInfo = managedApp[uid];
-            if (appInfo.isWhitelist()) continue;
+            // 50 内置白名单不必上报；40 自由后台必须上报，
+            // 否则 APP 列表看不到"自由后台但正在运行"的应用。
+            const bool freeBackground = appInfo.isWhitelist();
+            if (appInfo.freezeMode == FREEZE_MODE::WHITEFORCE) continue;
             memcpy(fullPath + len + 6, "/cmdline", 9);
             char readBuff[256]; // now is cmdline Content
             if (Utils::readString(fullPath, readBuff, sizeof(readBuff)) == 0) continue;
@@ -702,6 +705,12 @@ public:
             }
             totalSwapMiB += swapMiB;
 
+            if (freeBackground) {
+                // 自由后台：只上报状态，不参与冻结决策（不进 naughtyApp）
+                stateStr.appendFmt("%5d %4d %4d %5d 🆓自由后台 %s\n",
+                    pid, memMiB, swapMiB, uid, label.c_str());
+                continue;
+            }
             if (appInfo.isAudioPlaying) {
                 stateStr.appendFmt("%5d %4d %4d %5d 🎵正在播放 %s\n", pid, memMiB, swapMiB, uid, label.c_str());
                 continue;
@@ -876,6 +885,21 @@ public:
             if (appInfo.isPermissive) {
                 uint64_t speed = 0;
                 const NetworkActivity activity = sampleNetworkActivity(uid, speed);
+
+                if (activity == NetworkActivity::UNAVAILABLE) {
+                    // UID 流量取不到（BPF map 缺失 / SELinux 拒绝）时按"可能在下载"处理。
+                    // 宁可晚冻 10 秒，也不能让宽松模式静默退化成严格冻结。
+                    static time_t lastWarn = 0;
+                    const time_t now = time(nullptr);
+                    if (now - lastWarn > 300) {
+                        lastWarn = now;
+                        freezeit.log("UID 流量不可读(BPF map 缺失), 宽松模式转为保守放行");
+                    }
+                    remainSec = NETWORK_RECHECK_SECONDS;
+                    it++;
+                    continue;
+                }
+
                 if (activity == NetworkActivity::SAMPLING || activity == NetworkActivity::ACTIVE) {
                     remainSec = activity == NetworkActivity::ACTIVE ? NETWORK_RECHECK_SECONDS : 1;
                     if (activity == NetworkActivity::ACTIVE)
@@ -1527,9 +1551,6 @@ public:
     // 这里只在"确实有应用即将到期"时才额外问一次前台, 避免无谓的周期性开销。
     void refreshForegroundBeforeFreeze() {
         if (pendingHandleList.empty()) return;
-        // Frozen 自带 Doze 关闭时，息屏策略完全交给外部 DeviceIdle 管理器，
-        // 仍需复核宽松前台，不能因内部 standby 标志而降级。
-        if (settings.enableDoze && doze.isScreenOffStandby) return;
 
         bool hasImminent = false;
         for (const auto& [uid, remainSec] : pendingHandleList) {
@@ -1537,12 +1558,17 @@ public:
         }
         if (!hasImminent) return;
 
-        if (freezeit.SDK_INT_VER >= 31)
-            getVisibleAppByLocalSocket();
-        else
-            getVisibleAppByShellLRU();
+        // 息屏待机时不再打扰 system_server 取前台列表（省唤醒），
+        // 但宽松应用的网络保护由 processPendingApp 的 UID 流量采样独立兜底，
+        // 因此只跳过"问前台"，不跳过整个复核流程。
+        if (!(settings.enableDoze && doze.isScreenOffStandby)) {
+            if (freezeit.SDK_INT_VER >= 31)
+                getVisibleAppByLocalSocket();
+            else
+                getVisibleAppByShellLRU();
 
-        updateAppProcess();
+            updateAppProcess();
+        }
     }
 
     void cycleThreadFunc() {
