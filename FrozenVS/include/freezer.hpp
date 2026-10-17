@@ -856,6 +856,8 @@ public:
         for (const int uid : toBackgroundApp) { // 更新倒计时
             isupdate = true;
             managedApp[uid].delayCnt = 0;
+            // 宽松模式不参与冻结：连队列都不进，切后台也不会被墓碑
+            if (managedApp[uid].isPermissive) continue;
             pendingHandleList[uid] = managedApp[uid].isTerminateMode() ?
                 settings.terminateTimeout : settings.freezeTimeout;
         }
@@ -907,69 +909,12 @@ public:
                 }
             }
             if (appInfo.isPermissive) {
-                uint64_t speed = 0;
-                const NetworkActivity activity = sampleNetworkActivity(uid, speed);
-
-                if (activity == NetworkActivity::UNAVAILABLE) {
-                    // UID 流量取不到（BPF map 缺失 / SELinux 拒绝）时按"可能在下载"处理。
-                    // 宁可晚冻 10 秒，也不能让宽松模式静默退化成严格冻结。
-                    static time_t lastWarn = 0;
-                    const time_t now = time(nullptr);
-                    if (now - lastWarn > 300) {
-                        lastWarn = now;
-                        freezeit.log("UID 流量不可读(BPF map 缺失), 宽松模式转为保守放行");
-                    }
-                    remainSec = NETWORK_RECHECK_SECONDS;
-                    it++;
-                    continue;
-                }
-
-                if (activity == NetworkActivity::SAMPLING || activity == NetworkActivity::ACTIVE) {
-                    remainSec = activity == NetworkActivity::ACTIVE ? NETWORK_RECHECK_SECONDS : 1;
-                    if (activity == NetworkActivity::ACTIVE) {
-                        {
-                            lock_guard<mutex> lock(activityMutex);
-                            lastActiveTime[uid] = time(nullptr);
-                        }
-                        freezeit.logFmt("暂缓冻结 %s: 网络活跃 %llu KiB/s",
-                            appInfo.label.c_str(),
-                            static_cast<unsigned long long>(speed / 1024ULL));
-                    }
-                    it++;
-                    continue;
-                }
-
-                // UID 流量为 0 不代表没在下载：TUN / Clash / 代理模式下流量记在代理 UID 上，
-                // 目标应用自身的 netd 计数恒为 0。用进程级 IO + CPU 兜底。
-                uint64_t ioRate = 0, cpuRate = 0;
-                const bool busy = sampleProcActivity(uid, ioRate, cpuRate);
-                const int tcpCnt = countTcpConnections(uid);
-
-                const time_t nowGrace = time(nullptr);
-                long idleFor = -1;
-                {
-                    lock_guard<mutex> lock(activityMutex);
-                    if (busy || tcpCnt > 0) lastActiveTime[uid] = nowGrace;
-                    const auto itAct = lastActiveTime.find(uid);
-                    if (itAct != lastActiveTime.end() && itAct->second != 0)
-                        idleFor = static_cast<long>(nowGrace - itAct->second);
-                }
-
-                const bool inGrace = (idleFor >= 0 && idleFor < PERMISSIVE_GRACE_SECONDS);
-
-                freezeit.logFmt("宽松判定 %s(%d): 速度%lluB/s IO%lluB/s CPU%llu/s TCP%d 空闲%lds → %s",
-                    appInfo.label.c_str(), uid,
-                    static_cast<unsigned long long>(speed),
-                    static_cast<unsigned long long>(ioRate),
-                    static_cast<unsigned long long>(cpuRate),
-                    tcpCnt, idleFor,
-                    (busy || tcpCnt > 0 || inGrace) ? "放行" : "冻结");
-
-                if (busy || tcpCnt > 0 || inGrace) {
-                    remainSec = NETWORK_RECHECK_SECONDS;
-                    it++;
-                    continue;
-                }
+                // 宽松模式 = 不冻结。用户把应用设成"宽松"，要的就是它一直活着，
+                // 下载、后台任务、缓存都不该被墓碑打断。直接从待冻结队列摘掉。
+                freezeit.logFmt("宽松放行 %s(%d): 宽松模式不冻结", appInfo.label.c_str(), uid);
+                it = pendingHandleList.erase(it);
+                isupdate = true;
+                continue;
             }
             clearNetworkState(uid);
             int num = handleProcess(appInfo, true);
