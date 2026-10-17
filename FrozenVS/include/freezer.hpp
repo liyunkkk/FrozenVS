@@ -44,6 +44,20 @@ private:
     static constexpr int NETWORK_SAMPLE_MS = 1000;
     static constexpr uint64_t NETWORK_ENTER_BYTES_PER_SEC = 32ULL * 1024ULL;
     static constexpr uint64_t NETWORK_EXIT_BYTES_PER_SEC = 8ULL * 1024ULL;
+
+    // 进程活跃度兜底：TUN / Clash / 代理场景下，目标应用的流量记在代理 UID 上，
+    // netd 里该 uid 的计数恒为 0，只看 UID 流量会把正在下载的应用判成"空闲"。
+    // 这里用 /proc/<pid>/io 的 rchar+wchar 与 /proc/<pid>/stat 的 utime+stime 兜底。
+    static constexpr uint64_t PROC_IO_ACTIVE_BYTES_PER_SEC = 4ULL * 1024ULL;   // 4 KiB/s
+    static constexpr uint64_t PROC_CPU_ACTIVE_JIFFIES_PER_SEC = 5;             // 50 ms/s
+
+    struct ProcActivity {
+        uint64_t rchar = 0;
+        uint64_t wchar = 0;
+        uint64_t cpuTicks = 0;
+        time_t   sampledAt = 0;
+    };
+    unordered_map<int, ProcActivity> procActivitySamples;
     unordered_map<int, time_t> audioGraceUntil;
     enum class NetworkActivity {
         UNAVAILABLE,
@@ -750,19 +764,19 @@ public:
             }
             else if (!strcmp(readBuff, binder_wchan)) {
                 stateStr.appendFmt("⚠️运行中(Binder通信) %s\n", label.c_str());
-                naughtyApp.insert(uid);
+                if (!appInfo.isPermissive) naughtyApp.insert(uid);
             }
             else if (!strcmp(readBuff, pipe_wchan)) {
                 stateStr.appendFmt("⚠️运行中(管道通信) %s\n", label.c_str());
-                naughtyApp.insert(uid);
+                if (!appInfo.isPermissive) naughtyApp.insert(uid);
             }
             else if (!strcmp(readBuff, epoll_wait1_wchan) || !strcmp(readBuff, epoll_wait2_wchan)) {
                 stateStr.appendFmt("⚠️运行中(就绪态) %s\n", label.c_str());
-                naughtyApp.insert(uid);
+                if (!appInfo.isPermissive) naughtyApp.insert(uid);
             }
             else {
                 stateStr.appendFmt("⚠️运行中(%s) %s\n", (const char*)readBuff, label.c_str());
-                naughtyApp.insert(uid);
+                if (!appInfo.isPermissive) naughtyApp.insert(uid);
             }
         }
         closedir(dir);
@@ -906,6 +920,24 @@ public:
                         freezeit.logFmt("暂缓冻结 %s: 网络活跃 %llu KiB/s",
                             appInfo.label.c_str(),
                             static_cast<unsigned long long>(speed / 1024ULL));
+                    it++;
+                    continue;
+                }
+
+                // UID 流量为 0 不代表没在下载：TUN / Clash / 代理模式下流量记在代理 UID 上，
+                // 目标应用自身的 netd 计数恒为 0。用进程级 IO + CPU 兜底。
+                uint64_t ioRate = 0, cpuRate = 0;
+                if (sampleProcActivity(uid, ioRate, cpuRate)) {
+                    remainSec = NETWORK_RECHECK_SECONDS;
+                    static time_t lastBusyLog = 0;
+                    const time_t nowBusy = time(nullptr);
+                    if (nowBusy - lastBusyLog > 120) {
+                        lastBusyLog = nowBusy;
+                        freezeit.logFmt("暂缓冻结 %s: 进程活跃 IO %llu B/s CPU %llu jiffies/s (UID流量0, 代理场景)",
+                            appInfo.label.c_str(),
+                            static_cast<unsigned long long>(ioRate),
+                            static_cast<unsigned long long>(cpuRate));
+                    }
                     it++;
                     continue;
                 }
@@ -1303,6 +1335,99 @@ public:
         lock_guard<mutex> lock(activityMutex);
         networkSamples.erase(uid);
         networkProtected.erase(uid);
+        procActivitySamples.erase(uid);
+    }
+
+    // 读 /proc/<pid>/stat 的 utime+stime（jiffies）
+    static bool readProcStatTicks(const char* pidStr, uint64_t& ticks) {
+        char path[64];
+        FastSnprintf(path, sizeof(path), "/proc/%s/stat", pidStr);
+        char buf[512];
+        if (Utils::readString(path, buf, sizeof(buf)) == 0) return false;
+
+        // comm 字段可能含空格，从最后一个 ')' 之后开始解析
+        const char* p = strrchr(buf, ')');
+        if (p == nullptr) return false;
+
+        unsigned long long utime = 0, stime = 0;
+        // ) 之后: state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime
+        if (sscanf(p, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu",
+                &utime, &stime) != 2)
+            return false;
+
+        ticks = utime + stime;
+        return true;
+    }
+
+    // 读 /proc/<pid>/io 的 rchar+wchar（含 socket 与文件读写）
+    static bool readProcIo(const char* pidStr, uint64_t& rchar, uint64_t& wchar) {
+        char path[64];
+        FastSnprintf(path, sizeof(path), "/proc/%s/io", pidStr);
+        char buf[512];
+        if (Utils::readString(path, buf, sizeof(buf)) == 0) return false;
+
+        const char* r = strstr(buf, "rchar:");
+        const char* w = strstr(buf, "wchar:");
+        if (r == nullptr || w == nullptr) return false;
+
+        rchar = strtoull(r + 6, nullptr, 10);
+        wchar = strtoull(w + 6, nullptr, 10);
+        return true;
+    }
+
+    // 该 uid 是否有进程正在做实际 IO / 消耗 CPU。拿不到数据时返回 true（保守放行）。
+    bool sampleProcActivity(int uid, uint64_t& ioBytesPerSec, uint64_t& cpuJiffiesPerSec) {
+        uint64_t rchar = 0, wchar = 0, cpu = 0;
+        bool any = false;
+
+        DIR* dir = opendir("/proc");
+        if (dir == nullptr) return true;
+
+        struct dirent* f;
+        while ((f = readdir(dir)) != nullptr) {
+            if (f->d_type != DT_DIR || f->d_name[0] < '0' || f->d_name[0] > '9') continue;
+            const int pid = Fastatoi(f->d_name);
+            if (pid <= 100) continue;
+
+            char pdir[64];
+            FastSnprintf(pdir, sizeof(pdir), "/proc/%s", f->d_name);
+            struct stat sb {};
+            if (stat(pdir, &sb) || sb.st_uid != (uid_t)uid) continue;
+
+            uint64_t t = 0, r = 0, w = 0;
+            if (readProcStatTicks(f->d_name, t)) { cpu += t; any = true; }
+            if (readProcIo(f->d_name, r, w)) { rchar += r; wchar += w; any = true; }
+        }
+        closedir(dir);
+
+        if (!any) return true;
+
+        const time_t now = time(nullptr);
+        lock_guard<mutex> lock(activityMutex);
+        auto it = procActivitySamples.find(uid);
+        if (it == procActivitySamples.end()) {
+            procActivitySamples.emplace(uid, ProcActivity{ rchar, wchar, cpu, now });
+            return true;
+        }
+
+        auto& s = it->second;
+        const double dt = static_cast<double>(now - s.sampledAt);
+        if (dt < 1.0) return true;
+
+        const uint64_t dIo = (rchar >= s.rchar ? rchar - s.rchar : 0) +
+                             (wchar >= s.wchar ? wchar - s.wchar : 0);
+        const uint64_t dCpu = cpu >= s.cpuTicks ? cpu - s.cpuTicks : 0;
+
+        s.rchar = rchar;
+        s.wchar = wchar;
+        s.cpuTicks = cpu;
+        s.sampledAt = now;
+
+        ioBytesPerSec = static_cast<uint64_t>(dIo / dt);
+        cpuJiffiesPerSec = static_cast<uint64_t>(dCpu / dt);
+
+        return ioBytesPerSec >= PROC_IO_ACTIVE_BYTES_PER_SEC ||
+               cpuJiffiesPerSec >= PROC_CPU_ACTIVE_JIFFIES_PER_SEC;
     }
 
     NetworkActivity sampleNetworkActivity(int uid, uint64_t& speedBytesPerSec) {
