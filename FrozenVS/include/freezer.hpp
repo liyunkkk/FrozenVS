@@ -51,9 +51,9 @@ private:
     static constexpr uint64_t PROC_IO_ACTIVE_BYTES_PER_SEC = 4ULL * 1024ULL;   // 4 KiB/s
     static constexpr uint64_t PROC_CPU_ACTIVE_JIFFIES_PER_SEC = 5;             // 50 ms/s
 
-    // 宽松宽限期：最后一次"活跃"（网络/IO/CPU）之后，再多等这么久才允许冻结。
-    // 后台下载普遍有缓冲、分片、断点重连的停顿，10 秒就冻必然误伤。
-    static constexpr int PERMISSIVE_GRACE_SECONDS = 180;
+    // 宽松宽限期：最后一次"活跃"（网络/IO/CPU/TCP连接）之后，再多等这么久才允许冻结。
+    // 后台下载普遍有缓冲、分片、断点重连、连接挂起的停顿，宽限期必须给足。
+    static constexpr int PERMISSIVE_GRACE_SECONDS = 600;
 
     // 每个 uid 最后一次被观测到"活跃"的时刻
     unordered_map<int, time_t> lastActiveTime;
@@ -943,12 +943,13 @@ public:
                 // 目标应用自身的 netd 计数恒为 0。用进程级 IO + CPU 兜底。
                 uint64_t ioRate = 0, cpuRate = 0;
                 const bool busy = sampleProcActivity(uid, ioRate, cpuRate);
+                const int tcpCnt = countTcpConnections(uid);
 
                 const time_t nowGrace = time(nullptr);
                 long idleFor = -1;
                 {
                     lock_guard<mutex> lock(activityMutex);
-                    if (busy) lastActiveTime[uid] = nowGrace;
+                    if (busy || tcpCnt > 0) lastActiveTime[uid] = nowGrace;
                     const auto itAct = lastActiveTime.find(uid);
                     if (itAct != lastActiveTime.end() && itAct->second != 0)
                         idleFor = static_cast<long>(nowGrace - itAct->second);
@@ -956,15 +957,15 @@ public:
 
                 const bool inGrace = (idleFor >= 0 && idleFor < PERMISSIVE_GRACE_SECONDS);
 
-                freezeit.logFmt("宽松判定 %s(%d): 速度%lluB/s IO%lluB/s CPU%llu/s 空闲%lds → %s",
+                freezeit.logFmt("宽松判定 %s(%d): 速度%lluB/s IO%lluB/s CPU%llu/s TCP%d 空闲%lds → %s",
                     appInfo.label.c_str(), uid,
                     static_cast<unsigned long long>(speed),
                     static_cast<unsigned long long>(ioRate),
                     static_cast<unsigned long long>(cpuRate),
-                    idleFor,
-                    (busy || inGrace) ? "放行" : "冻结");
+                    tcpCnt, idleFor,
+                    (busy || tcpCnt > 0 || inGrace) ? "放行" : "冻结");
 
-                if (busy || inGrace) {
+                if (busy || tcpCnt > 0 || inGrace) {
                     remainSec = NETWORK_RECHECK_SECONDS;
                     it++;
                     continue;
@@ -1402,6 +1403,39 @@ public:
         rchar = strtoull(r + 6, nullptr, 10);
         wchar = strtoull(w + 6, nullptr, 10);
         return true;
+    }
+
+    // 该 uid 是否还挂着任何 TCP 连接（ESTABLISHED / CLOSE_WAIT / SYN_SENT 都算）。
+    // 下载卡住、连接挂起时 IO 和流量都会归零，但连接还在 —— 这是最后一道"任务未完成"信号。
+    static int countTcpConnections(int uid) {
+        const char* paths[] = { "/proc/net/tcp", "/proc/net/tcp6" };
+        char buf[96 * 1024];
+        int count = 0;
+
+        for (const char* path : paths) {
+            const size_t len = Utils::readString(path, buf, sizeof(buf));
+            if (len < 128) continue;
+
+            char* p = strchr(buf, '\n');   // 跳过表头
+            while (p != nullptr && *p) {
+                p++;
+                if (*p == 0) break;
+
+                char sl[16], local[64], rem[64], st[8];
+                unsigned long uidVal = 0;
+                if (sscanf(p, "%15s %63s %63s %7s %*s %*s %*s %lu",
+                        sl, local, rem, st, &uidVal) == 5) {
+                    if (static_cast<int>(uidVal) == uid) {
+                        // st: 01=ESTABLISHED 02=SYN_SENT 03=SYN_RECV 08=CLOSE_WAIT
+                        if (!strcmp(st, "01") || !strcmp(st, "02") ||
+                            !strcmp(st, "03") || !strcmp(st, "08"))
+                            count++;
+                    }
+                }
+                p = strchr(p, '\n');
+            }
+        }
+        return count;
     }
 
     // 该 uid 是否有进程正在做实际 IO / 消耗 CPU。拿不到数据时返回 true（保守放行）。
