@@ -1,6 +1,6 @@
 id=Frozen
 name=Frozen
 version=10.0
-versionCode=2026101702
+versionCode=2026101703
 author=MoWei
-description=Frozen (freebg-list + permissive-fix)
+description=Frozen (permissive-grace 180s)

@@ -51,6 +51,13 @@ private:
     static constexpr uint64_t PROC_IO_ACTIVE_BYTES_PER_SEC = 4ULL * 1024ULL;   // 4 KiB/s
     static constexpr uint64_t PROC_CPU_ACTIVE_JIFFIES_PER_SEC = 5;             // 50 ms/s
 
+    // 宽松宽限期：最后一次"活跃"（网络/IO/CPU）之后，再多等这么久才允许冻结。
+    // 后台下载普遍有缓冲、分片、断点重连的停顿，10 秒就冻必然误伤。
+    static constexpr int PERMISSIVE_GRACE_SECONDS = 180;
+
+    // 每个 uid 最后一次被观测到"活跃"的时刻
+    unordered_map<int, time_t> lastActiveTime;
+
     struct ProcActivity {
         uint64_t rchar = 0;
         uint64_t wchar = 0;
@@ -541,6 +548,9 @@ public:
                 auto& appInfo = managedApp[uid];
                 if (appInfo.isWhitelist())
                     continue;
+                // 宽松应用开机不强制冻结，交给正常的前台/活动判定流程
+                if (appInfo.isPermissive)
+                    continue;
 
                 memcpy(fullPath + len + 6, "/cmdline", 9);
                 char readBuff[256];
@@ -916,10 +926,15 @@ public:
 
                 if (activity == NetworkActivity::SAMPLING || activity == NetworkActivity::ACTIVE) {
                     remainSec = activity == NetworkActivity::ACTIVE ? NETWORK_RECHECK_SECONDS : 1;
-                    if (activity == NetworkActivity::ACTIVE)
+                    if (activity == NetworkActivity::ACTIVE) {
+                        {
+                            lock_guard<mutex> lock(activityMutex);
+                            lastActiveTime[uid] = time(nullptr);
+                        }
                         freezeit.logFmt("暂缓冻结 %s: 网络活跃 %llu KiB/s",
                             appInfo.label.c_str(),
                             static_cast<unsigned long long>(speed / 1024ULL));
+                    }
                     it++;
                     continue;
                 }
@@ -929,14 +944,27 @@ public:
                 uint64_t ioRate = 0, cpuRate = 0;
                 const bool busy = sampleProcActivity(uid, ioRate, cpuRate);
 
-                freezeit.logFmt("宽松判定 %s(%d): 流量IDLE 速度%lluB/s IO%lluB/s CPU%llu/s → %s",
+                const time_t nowGrace = time(nullptr);
+                long idleFor = -1;
+                {
+                    lock_guard<mutex> lock(activityMutex);
+                    if (busy) lastActiveTime[uid] = nowGrace;
+                    const auto itAct = lastActiveTime.find(uid);
+                    if (itAct != lastActiveTime.end() && itAct->second != 0)
+                        idleFor = static_cast<long>(nowGrace - itAct->second);
+                }
+
+                const bool inGrace = (idleFor >= 0 && idleFor < PERMISSIVE_GRACE_SECONDS);
+
+                freezeit.logFmt("宽松判定 %s(%d): 速度%lluB/s IO%lluB/s CPU%llu/s 空闲%lds → %s",
                     appInfo.label.c_str(), uid,
                     static_cast<unsigned long long>(speed),
                     static_cast<unsigned long long>(ioRate),
                     static_cast<unsigned long long>(cpuRate),
-                    busy ? "放行" : "冻结");
+                    idleFor,
+                    (busy || inGrace) ? "放行" : "冻结");
 
-                if (busy) {
+                if (busy || inGrace) {
                     remainSec = NETWORK_RECHECK_SECONDS;
                     it++;
                     continue;
@@ -1336,6 +1364,7 @@ public:
         networkSamples.erase(uid);
         networkProtected.erase(uid);
         procActivitySamples.erase(uid);
+        lastActiveTime.erase(uid);
     }
 
     // 读 /proc/<pid>/stat 的 utime+stime（jiffies）
