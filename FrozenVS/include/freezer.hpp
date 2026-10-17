@@ -57,6 +57,8 @@ private:
 
     // 每个 uid 最后一次被观测到"活跃"的时刻
     unordered_map<int, time_t> lastActiveTime;
+    // 每个 uid 上次采样到的"打开文件总字节数"，用于判定是否正在下载
+    unordered_map<int, uint64_t> openFileBytes;
 
     struct ProcActivity {
         uint64_t rchar = 0;
@@ -856,8 +858,6 @@ public:
         for (const int uid : toBackgroundApp) { // 更新倒计时
             isupdate = true;
             managedApp[uid].delayCnt = 0;
-            // 宽松模式不参与冻结：连队列都不进，切后台也不会被墓碑
-            if (managedApp[uid].isPermissive) continue;
             pendingHandleList[uid] = managedApp[uid].isTerminateMode() ?
                 settings.terminateTimeout : settings.freezeTimeout;
         }
@@ -909,12 +909,54 @@ public:
                 }
             }
             if (appInfo.isPermissive) {
-                // 宽松模式 = 不冻结。用户把应用设成"宽松"，要的就是它一直活着，
-                // 下载、后台任务、缓存都不该被墓碑打断。直接从待冻结队列摘掉。
-                freezeit.logFmt("宽松放行 %s(%d): 宽松模式不冻结", appInfo.label.c_str(), uid);
-                it = pendingHandleList.erase(it);
-                isupdate = true;
-                continue;
+                // 宽松模式：正在下载就不冻，下载完再按用户设定的秒数冻。
+                // "正在下载"用两个信号判定：
+                //   1) netd 的 UID 流量（直连场景准）
+                //   2) 该 uid 打开的文件总字节数在增长（TUN / 代理场景唯一可靠的信号）
+                uint64_t speed = 0;
+                const NetworkActivity activity = sampleNetworkActivity(uid, speed);
+                const bool netActive = (activity == NetworkActivity::ACTIVE);
+
+                const uint64_t openBytes = sampleOpenFileBytes(uid);
+                bool downloading = false;
+                {
+                    lock_guard<mutex> lock(activityMutex);
+                    auto itFile = openFileBytes.find(uid);
+                    if (itFile == openFileBytes.end()) {
+                        openFileBytes[uid] = openBytes;
+                    }
+                    else {
+                        // 一个检查周期内增长 ≥ 32 KiB 视为正在写入下载文件
+                        downloading = (openBytes > itFile->second) &&
+                            (openBytes - itFile->second >= 32ULL * 1024ULL);
+                        itFile->second = openBytes;
+                    }
+                }
+
+                const time_t nowIdle = time(nullptr);
+                long idleFor = -1;   // -1 = 从未观测到活跃
+                {
+                    lock_guard<mutex> lock(activityMutex);
+                    auto& last = lastActiveTime[uid];
+                    if (netActive || downloading) last = nowIdle;
+                    if (last != 0) idleFor = static_cast<long>(nowIdle - last);
+                }
+
+                // 下载中，或距最后一次下载不足用户设定的冻结超时 → 继续放行
+                const bool keepAlive = (idleFor >= 0 && idleFor < settings.freezeTimeout);
+
+                freezeit.logFmt("宽松判定 %s(%d): 网络%d 下载%d 文件%lluB 空闲%lds/%ds → %s",
+                    appInfo.label.c_str(), uid,
+                    netActive ? 1 : 0, downloading ? 1 : 0,
+                    static_cast<unsigned long long>(openBytes),
+                    idleFor, settings.freezeTimeout,
+                    keepAlive ? "放行" : "冻结");
+
+                if (keepAlive) {
+                    remainSec = NETWORK_RECHECK_SECONDS;
+                    it++;
+                    continue;
+                }
             }
             clearNetworkState(uid);
             int num = handleProcess(appInfo, true);
@@ -1381,6 +1423,58 @@ public:
             }
         }
         return count;
+    }
+
+    // 该 uid 所有进程打开的正规文件总字节数。
+    // 后台下载在 TUN / 代理下可能拿不到 UID 流量，但正在写的下载文件一定在变大。
+    static uint64_t sampleOpenFileBytes(int uid) {
+        uint64_t total = 0;
+        DIR* proc = opendir("/proc");
+        if (proc == nullptr) return 0;
+
+        struct dirent* pe;
+        while ((pe = readdir(proc)) != nullptr) {
+            if (pe->d_type != DT_DIR || pe->d_name[0] < '0' || pe->d_name[0] > '9') continue;
+            const int pid = Fastatoi(pe->d_name);
+            if (pid <= 100) continue;
+
+            char pdir[64];
+            FastSnprintf(pdir, sizeof(pdir), "/proc/%s", pe->d_name);
+            struct stat sb {};
+            if (stat(pdir, &sb) || sb.st_uid != (uid_t)uid) continue;
+
+            char fddir[80];
+            FastSnprintf(fddir, sizeof(fddir), "/proc/%s/fd", pe->d_name);
+            DIR* fds = opendir(fddir);
+            if (fds == nullptr) continue;
+
+            struct dirent* fe;
+            while ((fe = readdir(fds)) != nullptr) {
+                if (fe->d_name[0] < '0' || fe->d_name[0] > '9') continue;
+
+                char linkPath[112];
+                FastSnprintf(linkPath, sizeof(linkPath), "/proc/%s/fd/%s", pe->d_name, fe->d_name);
+
+                char target[256];
+                const ssize_t n = readlink(linkPath, target, sizeof(target) - 1);
+                if (n <= 0) continue;
+                target[n] = 0;
+
+                if (target[0] != '/') continue;                 // socket: / anon_inode: / pipe:
+                if (!strncmp(target, "/dev/", 5)) continue;
+                if (!strncmp(target, "/proc/", 6)) continue;
+                if (!strncmp(target, "/sys/", 5)) continue;
+
+                struct stat fs {};
+                if (stat(target, &fs)) continue;
+                if (!S_ISREG(fs.st_mode)) continue;
+
+                total += static_cast<uint64_t>(fs.st_size);
+            }
+            closedir(fds);
+        }
+        closedir(proc);
+        return total;
     }
 
     // 该 uid 是否有进程正在做实际 IO / 消耗 CPU。拿不到数据时返回 true（保守放行）。
