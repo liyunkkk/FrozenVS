@@ -142,6 +142,7 @@ enum class XPOSED_CMD : uint32_t {
     UPDATE_PENDING = baseCode + 60,   // 更新待冻结应用
     GET_AUDIO = baseCode + 81, // 获取音频信息
     GET_INTENT = baseCode + 91, // 获取后台意图
+    GET_NETWORK_ACTIVE = baseCode + 100, // 网速活跃(≥100KiB/s)的宽松应用 uid
 };
 
 enum class REPLY : uint32_t {

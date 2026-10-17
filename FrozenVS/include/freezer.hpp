@@ -23,6 +23,7 @@ private:
     unordered_map<int, int> pendingHandleList;     //挂起列队 无论黑白名单 { uid, timeRemain:sec }
     unordered_set<int> lastForegroundApp;          //前台应用
     unordered_set<int> curForegroundApp;           //新前台应用
+    unordered_set<int> curNetworkActive;           //网速≥阈值(由Xposed侧netstats统计)的宽松应用
     unordered_set<int> curFgBackup;                //新前台应用备份 用于进入doze前备份， 退出后恢复
     unordered_set<int> naughtyApp;                 //冻结期间存在异常解冻或唤醒进程的应用
     vector<int> lastAudioApp;                      //上次播放音频的应用  
@@ -909,10 +910,19 @@ public:
                 }
             }
             if (appInfo.isPermissive) {
+                // 信号 0：Xposed 侧 netstats 统计的网速（照 Cirno 的 NETWORK_SPEED 豁免）。
+                // 这是最权威的一路：不受 SELinux 限制，TUN/代理下也是应用自身 socket 口径。
+                if (curNetworkActive.contains(uid)) {
+                    freezeit.logFmt("暂缓冻结 %s: 网速活跃(netstats ≥100KiB/s)", appInfo.label.c_str());
+                    remainSec = NETWORK_RECHECK_SECONDS;
+                    it++;
+                    continue;
+                }
+
                 // 宽松模式：正在下载就不冻，下载完再按用户设定的秒数冻。
-                // "正在下载"用两个信号判定：
+                // 其余两个信号：
                 //   1) netd 的 UID 流量（直连场景准）
-                //   2) 该 uid 打开的文件总字节数在增长（TUN / 代理场景唯一可靠的信号）
+                //   2) 该 uid 打开的文件总字节数在增长（TUN / 代理场景的兜底）
                 uint64_t speed = 0;
                 const NetworkActivity activity = sampleNetworkActivity(uid, speed);
                 const bool netActive = (activity == NetworkActivity::ACTIVE);
@@ -1177,6 +1187,37 @@ public:
         }
 		END_TIME_COUNT;
 	}
+
+    // 拉取"网速活跃"的宽松应用 uid（Xposed 侧用 netstats 服务统计，阈值 100 KiB/s）。
+    // 这是照 Cirno 的 FreezeExemption.NETWORK_SPEED：有网速就不冻结。
+    void getNetworkActiveByLocalSocket() {
+        START_TIME_COUNT;
+
+        int buff[64];
+        const int recvLen = Utils::localSocketRequest(XPOSED_CMD::GET_NETWORK_ACTIVE, nullptr, 0,
+            buff, sizeof(buff));
+
+        if (recvLen < 4) {
+            // Xposed 侧未实现该命令时返回空，不影响主流程
+            curNetworkActive.clear();
+            END_TIME_COUNT;
+            return;
+        }
+
+        int& uidLen = buff[0];
+        if (uidLen < 0 || uidLen > 15 || uidLen != (recvLen / 4 - 1)) {
+            curNetworkActive.clear();
+            END_TIME_COUNT;
+            return;
+        }
+
+        curNetworkActive.clear();
+        for (int i = 1; i <= uidLen; i++) {
+            const int uid = buff[i];
+            if (managedApp.contains(uid)) curNetworkActive.insert(uid);
+        }
+        END_TIME_COUNT;
+    }
 
     void getVisibleAppByLocalSocket() {
         START_TIME_COUNT;
@@ -1784,6 +1825,9 @@ public:
             if (remainSec <= 2) { hasImminent = true; break; }
         }
         if (!hasImminent) return;
+
+        // 网速活跃列表：息屏下载同样要保护，因此不受 Doze 判断影响
+        getNetworkActiveByLocalSocket();
 
         // 息屏待机时不再打扰 system_server 取前台列表（省唤醒），
         // 但宽松应用的网络保护由 processPendingApp 的 UID 流量采样独立兜底，
