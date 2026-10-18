@@ -138,9 +138,10 @@ public:
 
         toFileFlag = argc > 1;
         if (toFileFlag) {
-            if (position)toFile(logCache, position);
-            constexpr const char tips[] = "日志已通过文件输出: /sdcard/Android/Frozen.log";
+            // 日志同时进内存缓冲(APP 日志页)与文件, 两者互不替代
+            constexpr const char tips[] = "日志同时输出到 APP 与 /sdcard/Android/Frozen.log";
             toMem(tips, sizeof(tips) - 1);
+            toFile(tips, sizeof(tips) - 1);
         }
 
         propPath = modulePath + "/module.prop";
@@ -283,10 +284,9 @@ public:
 
         lineCache[len++] = '\n';
 
+        toMem(lineCache, len);
         if (toFileFlag)
             toFile(lineCache, len);
-        else
-            toMem(lineCache, len);
     }
 
 
@@ -306,10 +306,9 @@ public:
 
         lineCache[len++] = '\n';
 
+        toMem(lineCache, len);
         if (toFileFlag)
             toFile(lineCache, len);
-        else
-            toMem(lineCache, len);
     }
 
     void debug(const string_view& str) {
@@ -324,10 +323,9 @@ public:
 
         lineCache[len++] = '\n';
 
+        toMem(lineCache, len);
         if (toFileFlag)
             toFile(lineCache, len);
-        else
-            toMem(lineCache, len);
     }
 
     template<typename... Args>
@@ -348,10 +346,9 @@ public:
 
         lineCache[len++] = '\n';
 
+        toMem(lineCache, len);
         if (toFileFlag)
             toFile(lineCache, len);
-        else
-            toMem(lineCache, len);
     }
 
     void clearLog() {

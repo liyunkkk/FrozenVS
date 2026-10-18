@@ -1,6 +1,6 @@
 id=Frozen
 name=Frozen
 version=10.0
-versionCode=2026101707
+versionCode=2026101708
 author=MoWei
-description=Frozen (netstats speed exempt, like Cirno)
+description=Frozen (netstats speed exempt + dual log)
