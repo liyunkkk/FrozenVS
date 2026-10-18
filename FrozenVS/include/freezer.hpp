@@ -871,6 +871,11 @@ public:
     void processPendingApp() {
         bool isupdate = false;
 
+        // 每次判定前刷新网速活跃列表（Xposed 侧每秒用 netstats 更新一次）。
+        // 放在这里而不是只在 remainSec<=2 时拉，保证判定用的是最新数据。
+        if (!pendingHandleList.empty())
+            getNetworkActiveByLocalSocket();
+
         auto it = pendingHandleList.begin();
         while (it != pendingHandleList.end()) {
             auto& remainSec = it->second;
@@ -1825,9 +1830,6 @@ public:
             if (remainSec <= 2) { hasImminent = true; break; }
         }
         if (!hasImminent) return;
-
-        // 网速活跃列表：息屏下载同样要保护，因此不受 Doze 判断影响
-        getNetworkActiveByLocalSocket();
 
         // 息屏待机时不再打扰 system_server 取前台列表（省唤醒），
         // 但宽松应用的网络保护由 processPendingApp 的 UID 流量采样独立兜底，
